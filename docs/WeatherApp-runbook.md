@@ -978,8 +978,8 @@ aws route53 list-resource-record-sets --hosted-zone-id ABC-EXAMPLE-XXXX \
 ```
 Expect output like:
 ```
-api.weather.craftingnewtech.com. 60 IN A 203.0.113.10
-api.weather.craftingnewtech.com. 60 IN A 203.0.113.20
+api.weather.craftingnewtech.com. 60 IN A ABC-EXAMPLE-XXXX
+api.weather.craftingnewtech.com. 60 IN A ABC-EXAMPLE-XXXX
 ```
 The `60` immediately after the domain name on each line is the TTL in
 seconds. If this ever shows something other than 60, the alias target
