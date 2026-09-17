@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — DynamoDB Caching Layer.
+  Stores OpenWeatherMap API responses keyed by lowercase city name.
+  TTL is set to 900 seconds (15 minutes) by the Lambda function so
+  DynamoDB automatically purges stale items — no maintenance job needed.
+  On-Demand billing means zero cost when idle and no capacity planning.
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier used in resource names and tags.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - production
+      - staging
+    Description: Deployment environment.
+
+  TTLAttributeName:
+    Type: String
+    Default: ttl
+    Description: >
+      DynamoDB attribute that holds the UNIX expiry timestamp.
+      Must match the attribute name written by backend/lambda/cache.py.
+
+  PointInTimeRecoveryEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Enable point-in-time recovery (PITR). Off by default — this is a
+      short-lived weather cache, not a data-of-record. Enable for staging
+      if you need to inspect historical cache state.
+
+# ── Conditions ───────────────────────────────────────────────────────────────
+Conditions:
+  IsPITREnabled: !Equals [!Ref PointInTimeRecoveryEnabled, 'true']
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── DynamoDB Table ──────────────────────────────────────────────────────────
+  # PAY_PER_REQUEST (On-Demand) — no provisioned WCU/RCU needed for a cache
+  # that receives < 50k requests/month at typical portfolio traffic levels.
+  # Scales automatically to any traffic spike without manual adjustment.
+  WeatherCacheTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_28
+            comment: "Cache table uses 15-min TTL — PITR adds cost for data that expires automatically; backup is pointless for a weather cache"
+          - id: CKV_AWS_119
+            comment: "AWS-managed DynamoDB encryption is sufficient; CMK adds ~$1/month per key without meaningful security benefit at portfolio scale"
+    Properties:
+      TableName: WeatherCache
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD
+
+      # Schema — only the partition key is defined here.
+      # Non-key attributes (data, ttl, cached_at) are schemaless.
+      AttributeDefinitions:
+        - AttributeName: city
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: city
+          KeyType: HASH
+
+      # TTL — DynamoDB reads the `ttl` attribute (UNIX seconds) and
+      # automatically deletes expired items in the background.
+      # Deletion is eventual (up to 48 h after expiry) so cache.py
+      # double-checks the TTL value on every read.
+      TimeToLiveSpecification:
+        AttributeName: !Ref TTLAttributeName
+        Enabled: true
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsPITREnabled, true, false]
+
+      # Server-side encryption with AWS-owned key (no extra cost).
+      SSESpecification:
+        SSEEnabled: true
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  TableName:
+    Description: >
+      DynamoDB table name — referenced by the Lambda environment variable
+      and must match the _TABLE_NAME constant in backend/lambda/cache.py.
+    Value: !Ref WeatherCacheTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+
+  TableArn:
+    Description: >
+      Table ARN — used by 01-iam.yml to scope the Lambda execution role's
+      DynamoDB permissions to this specific table only (least privilege).
+    Value: !GetAtt WeatherCacheTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TableArn'
+
+  TTLAttributeName:
+    Description: 'TTL attribute name — for reference in Lambda and monitoring.'
+    Value: !Ref TTLAttributeName
+    Export:
+      Name: !Sub '${AWS::StackName}-TTLAttributeName'

@@ -1,0 +1,715 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — Application CI/CD Pipeline. Six stages: Source
+  (CodeCommit) → Validate (pip-audit) → Test (pytest + coverage) →
+  ApproveDeploy (manual) → Deploy (Lambda + canary + PC + frontend + CDN)
+  → ValidateDeployment (live smoke test). Started by the Infra pipeline's
+  PipelineFilterFunction for app-only pushes, or released by
+  PipelineReleaseFunction after the Infra pipeline succeeds on a combined
+  push. See docs/WeatherApp-PipeSplit-ImplePlan-V1.md Deploy B / §B.5.
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier used in resource names and tags.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment.
+
+  ArtifactsBucketName:
+    Type: String
+    Description: >
+      S3 bucket for pipeline artifact staging (from 02-storage stack).
+
+  AppCodeBuildRoleArn:
+    Type: String
+    Description: App CodeBuild role ARN (from 01-iam stack).
+
+  CodePipelineServiceRoleArn:
+    Type: String
+    Description: >
+      CodePipeline service role ARN (from 01-iam stack). Shared with the
+      Infra pipeline — one role runs both pipelines.
+
+  PipelineReleaseLambdaRoleArn:
+    Type: String
+    Description: Pipeline release Lambda role ARN (from 01-iam stack).
+
+  WebsiteBucketName:
+    Type: String
+    Description: S3 website bucket name (from 02-storage stack).
+
+  LambdaFunctionName:
+    Type: String
+    Description: Lambda function name (from 05-backend stack).
+
+  CloudFrontDistributionId:
+    Type: String
+    Description: CloudFront distribution ID (from 03-cdn stack).
+
+  ApiEndpoint:
+    Type: String
+    Description: >
+      API Gateway base invoke URL (from 06-api stack). Passed to the
+      ValidateDeployment stage's post-deploy smoke test.
+
+  FrontendDomain:
+    Type: String
+    Default: 'weather.craftingnewtech.com'
+    Description: >
+      Frontend custom domain (no scheme). Reuses master.yml's
+      AlternateDomainName so this value has a single source of truth rather
+      than a second hardcoded default — passed to the ValidateDeployment
+      stage's cache-bypassed live validation
+      (pipeline/scripts/validate-live-deployment.sh).
+
+  ApiCustomDomain:
+    Type: String
+    Default: 'https://api.weather.craftingnewtech.com'
+    Description: >
+      API custom domain (with scheme) — must match 06-api.yml's
+      ApiSubdomain default exactly, since nothing currently threads this
+      value through master.yml (same as ApiSubdomain itself). Passed to the
+      ValidateDeployment stage's cache-bypassed live validation.
+
+  BranchName:
+    Type: String
+    Default: main
+    Description: CodeCommit branch that triggers the pipeline.
+
+  BuildImage:
+    Type: String
+    Default: 'aws/codebuild/standard:7.0'
+    Description: CodeBuild managed image.
+
+  SecondaryArtifactsBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      us-west-2 artifacts bucket name. Adds a DeploySecondary stage that
+      copies the just-built Lambda ZIP there, publishes a version, and runs
+      the canary shift in us-west-2 — no frontend sync/CloudFront
+      invalidation/Provisioned Concurrency, those stay primary-only (see
+      docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md §0.2/§2.7).
+      Leave blank to skip.
+
+  SecondaryRegion:
+    Type: String
+    Default: 'us-west-2'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+    Description: CloudWatch log retention for all CodeBuild/Lambda log groups.
+
+# ── Conditions ───────────────────────────────────────────────────────────────
+Conditions:
+  HasSecondaryDeploy: !Not [!Equals [!Ref SecondaryArtifactsBucketName, '']]
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── CloudWatch Log Groups — one per stage ──────────────────────────────────
+  AppValidateLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypted by default; KMS CMK adds cost without benefit for build logs"
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-app-validate-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  AppTestLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypted by default; KMS CMK adds cost without benefit for build logs"
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-app-test-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  AppDeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypted by default; KMS CMK adds cost without benefit for build logs"
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-app-deploy-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  AppDeploySecondaryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasSecondaryDeploy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypted by default; KMS CMK adds cost without benefit for build logs"
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-app-deploy-secondary-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  AppValidateDeploymentLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypted by default; KMS CMK adds cost without benefit for build logs"
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-app-validate-deployment-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  PipelineReleaseFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypted by default; KMS CMK adds cost without benefit for this Lambda log"
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-pipeline-release-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ── Manual Approval — SNS Topic (App pipeline's own gate) ──────────────────
+  # Subscribe after this stack deploys:
+  #   aws sns subscribe --topic-arn <AppDeployApprovalTopicArn> \
+  #     --protocol email --notification-endpoint you@example.com
+  AppDeployApprovalTopic:
+    Type: AWS::SNS::Topic
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_26
+            comment: "SNS topic delivers deploy-approval notifications (email only) — no PII or secrets in messages; KMS adds cost without security benefit"
+    Properties:
+      TopicName: !Sub '${ProjectName}-app-deploy-approval-${Environment}'
+      DisplayName: 'Weather Dashboard — App deploy approval requests'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Stage 2: Validate — CodeBuild Project ─────────────────────────────────
+  # Gate 4: pip-audit dependency CVE scan on the Lambda's own requirements.
+  # Python 3.14 — pure static analysis, doesn't need to match the Lambda's
+  # deployed Runtime (still python3.11).
+  AppValidateProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-app-validate-${Environment}'
+      Description: 'Dependency CVE scan (pip-audit) on the Lambda requirements.'
+      ServiceRole: !Ref AppCodeBuildRoleArn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec/validate-app.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref BuildImage
+        PrivilegedMode: false
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref AppValidateLogGroup
+          Status: ENABLED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Stage 3: Test — CodeBuild Project ─────────────────────────────────────
+  # Gate 5: pytest unit tests with 80% coverage requirement. Python kept at
+  # 3.11 (see pipeline/buildspec/test.yml) to match the Lambda's deployed
+  # Runtime, since this stage imports backend/lambda/*.py directly.
+  AppTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-app-test-${Environment}'
+      Description: 'pytest unit tests + 80% coverage gate. Coverage report published to CodeBuild Reports.'
+      ServiceRole: !Ref AppCodeBuildRoleArn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec/test.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref BuildImage
+        PrivilegedMode: false
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref AppTestLogGroup
+          Status: ENABLED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Stage 5: Deploy — CodeBuild Project ───────────────────────────────────
+  # Runs only after Validate and Test succeed. Lambda publish → canary shift
+  # → Provisioned Concurrency → frontend sync → CF invalidation. Never
+  # touches a CloudFormation stack — that's the Infra pipeline's job.
+  AppDeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-app-deploy-${Environment}'
+      Description: 'Lambda publish, canary shift, PC, frontend sync, CF invalidation.'
+      ServiceRole: !Ref AppCodeBuildRoleArn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec/deploy-app.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref BuildImage
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ARTIFACTS_BUCKET
+            Value: !Ref ArtifactsBucketName
+          - Name: WEBSITE_BUCKET
+            Value: !Ref WebsiteBucketName
+          - Name: LAMBDA_FUNCTION_NAME
+            Value: !Ref LambdaFunctionName
+          - Name: CLOUDFRONT_DISTRIBUTION_ID
+            Value: !Ref CloudFrontDistributionId
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref AppDeployLogGroup
+          Status: ENABLED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Stage 5b: DeploySecondary — CodeBuild Project (multi-region) ──────────
+  # Same-region CodeBuild action whose buildspec targets --region us-west-2 —
+  # no CodePipeline cross-region machinery, same reasoning as the Infra
+  # pipeline's DeploySecondaryProject. Copies the Lambda ZIP AppDeployProject
+  # just built/uploaded, publishes a version, runs the canary shift in
+  # us-west-2. No frontend sync/CloudFront/PC — primary-region-only.
+  AppDeploySecondaryProject:
+    Type: AWS::CodeBuild::Project
+    Condition: HasSecondaryDeploy
+    Properties:
+      Name: !Sub '${ProjectName}-app-deploy-secondary-${Environment}'
+      Description: 'Publish Lambda version + canary shift in the multi-region failover region.'
+      ServiceRole: !Ref AppCodeBuildRoleArn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec/deploy-app-secondary.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref BuildImage
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ARTIFACTS_BUCKET
+            Value: !Ref ArtifactsBucketName
+          - Name: SECONDARY_ARTIFACTS_BUCKET
+            Value: !Ref SecondaryArtifactsBucketName
+          - Name: LAMBDA_FUNCTION_NAME
+            Value: !Ref LambdaFunctionName
+          - Name: SECONDARY_REGION
+            Value: !Ref SecondaryRegion
+          # scripts/deploy-canary.sh has no --region flags of its own — this
+          # is what points its internal AWS CLI calls at the secondary
+          # region without modifying that shared script. Every command this
+          # buildspec writes directly still uses an explicit --region flag.
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref SecondaryRegion
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref AppDeploySecondaryLogGroup
+          Status: ENABLED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Stage 6: ValidateDeployment — CodeBuild Project ───────────────────────
+  # Runs AFTER Deploy. Two layers: (1) a fast curl smoke test against the
+  # raw execute-api endpoint, confirming the Lambda update itself serves
+  # correct data; (2) a cache-bypassed live validation
+  # (validate-live-deployment.sh) against the CUSTOM domain the real
+  # frontend actually calls, confirming the CloudFront invalidation
+  # completed, the deployed CSP/config.js agree, and OpenWeatherMap was
+  # genuinely reached — not just DynamoDB's 15-min cache. See
+  # docs/WeatherApp-BrowserCacheMemory-Details-V1.md section 7 for why both
+  # layers are needed (the 2026-07-24 incident passed a curl-only check).
+  AppValidateDeploymentProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-app-validate-deployment-${Environment}'
+      Description: 'Curl smoke test + cache-bypassed live validation post-deploy.'
+      ServiceRole: !Ref AppCodeBuildRoleArn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec/validate-deployment.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref BuildImage
+        PrivilegedMode: false
+        EnvironmentVariables:
+          # ApiEndpoint is the execute-api base URL — used for the fast,
+          # DNS/CloudFront-independent smoke test only.
+          - Name: API_ENDPOINT
+            Value: !Ref ApiEndpoint
+          - Name: FRONTEND_DOMAIN
+            Value: !Ref FrontendDomain
+          - Name: API_CUSTOM_DOMAIN
+            Value: !Ref ApiCustomDomain
+          - Name: CLOUDFRONT_DISTRIBUTION_ID
+            Value: !Ref CloudFrontDistributionId
+          - Name: LAMBDA_FUNCTION_NAME
+            Value: !Ref LambdaFunctionName
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref AppValidateDeploymentLogGroup
+          Status: ENABLED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── App CodePipeline ─────────────────────────────────────────────────────────
+  # RepositoryName computed via Ref ProjectName (same trick 08-pipeline.yml
+  # uses for its own CodeCommitRepository) rather than GetAtt from that
+  # template's CodeCommitRepository resource — avoids any cross-stack
+  # dependency between the two pipeline templates.
+  AppPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-app-pipeline-${Environment}'
+      RoleArn: !Ref CodePipelineServiceRoleArn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucketName
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: CodeCommitSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !Ref ProjectName
+                BranchName: !Ref BranchName
+                PollForSourceChanges: 'false'
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Validate
+          Actions:
+            - Name: DependencyCVEScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref AppValidateProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Test
+          Actions:
+            - Name: UnitTestsCoverage
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref AppTestProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: TestArtifact
+              RunOrder: 1
+
+        - Name: ApproveDeploy
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref AppDeployApprovalTopic
+                CustomData: 'Review the App pipeline Test stage output, then approve to deploy application code to production.'
+              RunOrder: 1
+
+        - Name: Deploy
+          Actions:
+            - Name: PublishAndSync
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref AppDeployProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: DeployArtifact
+              RunOrder: 1
+
+        - !If
+          - HasSecondaryDeploy
+          - Name: DeploySecondary
+            Actions:
+              - Name: PublishAndShiftSecondary
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref AppDeploySecondaryProject
+                InputArtifacts:
+                  - Name: SourceArtifact
+                RunOrder: 1
+          - !Ref AWS::NoValue
+
+        - Name: ValidateDeployment
+          Actions:
+            - Name: SmokeTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref AppValidateDeploymentProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Pipeline Release Lambda ─────────────────────────────────────────────────
+  # Triggered by the Infra pipeline's state-change EventBridge rule (below).
+  # Releases a held App pipeline execution once the Infra pipeline reaches a
+  # terminal state — see docs/WeatherApp-PipeSplit-ImplePlan-V1.md §0.2 gap #2
+  # for why a bare EventBridge-rule-to-StartPipelineExecution isn't enough on
+  # its own (no way to know whether a given release is expected, no handling
+  # for Infra failing).
+  PipelineReleaseFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PipelineReleaseFunctionLogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_116
+            comment: "DLQ not warranted — failures are logged; fail-safe clears the pending flag on any terminal state"
+          - id: CKV_AWS_117
+            comment: "VPC not required — function only calls AWS service APIs via service endpoints"
+          - id: CKV_AWS_50
+            comment: "X-Ray tracing not required for a lightweight internal coordination function"
+          - id: CKV_AWS_115
+            comment: "Reserved concurrency not set — function is low-volume (fires only on Infra pipeline state changes)"
+          - id: CKV_AWS_173
+            comment: "KMS encryption not required — env vars contain only pipeline/parameter names, not secrets"
+    Properties:
+      FunctionName: !Sub '${ProjectName}-pipeline-release-${Environment}'
+      Description: 'Releases a held App pipeline execution once the Infra pipeline reaches a terminal state.'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !Ref PipelineReleaseLambdaRoleArn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          APP_PIPELINE_NAME: !Ref AppPipeline
+          PENDING_PARAM_NAME: !Sub '/${ProjectName}/pipeline-coordination/pending-app-release-${Environment}'
+      Code:
+        ZipFile: |
+          import logging, os
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          codepipeline = boto3.client('codepipeline')
+          ssm = boto3.client('ssm')
+
+          APP_PIPELINE_NAME = os.environ['APP_PIPELINE_NAME']
+          PENDING_PARAM_NAME = os.environ['PENDING_PARAM_NAME']
+
+          def handler(event, context):
+              detail = event.get('detail', {})
+              pipeline = detail.get('pipeline')
+              state = detail.get('state')
+              execution_id = detail.get('execution-id')
+              logger.info('Infra pipeline state change: pipeline=%s state=%s execution=%s',
+                           pipeline, state, execution_id)
+
+              try:
+                  pending = ssm.get_parameter(Name=PENDING_PARAM_NAME)['Parameter']['Value']
+              except ssm.exceptions.ParameterNotFound:
+                  logger.info('No pending app release queued — nothing to do')
+                  return {'status': 'noop', 'reason': 'no-pending-release'}
+
+              if state == 'SUCCEEDED':
+                  logger.info('Infra pipeline succeeded (commit %s) — releasing App pipeline', pending)
+                  codepipeline.start_pipeline_execution(name=APP_PIPELINE_NAME)
+                  ssm.delete_parameter(Name=PENDING_PARAM_NAME)
+                  return {'status': 'released', 'commit': pending}
+
+              logger.info('Infra pipeline ended in state=%s (commit %s) — clearing pending release '
+                          'WITHOUT starting the App pipeline. Fix the infra deploy and re-push to retry.',
+                          state, pending)
+              ssm.delete_parameter(Name=PENDING_PARAM_NAME)
+              return {'status': 'cleared-no-release', 'state': state, 'commit': pending}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PipelineReleaseFunctionEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PipelineReleaseFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InfraPipelineStateRule.Arn
+
+  # ── EventBridge Rule — Infra pipeline terminal state → release Lambda ──────
+  # Watches the Infra pipeline by its computed name (Sub, not GetAtt from
+  # 08-pipeline.yml) — same anti-deadlock reasoning as PipelineFilterFunction
+  # above.
+  InfraPipelineStateRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-infra-release-app-${Environment}'
+      Description: !Sub >-
+        Fires the App pipeline release Lambda whenever the Infra pipeline
+        (${ProjectName}-infra-pipeline-${Environment}) reaches SUCCEEDED,
+        FAILED, or STOPPED.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codepipeline
+        detail-type:
+          - 'CodePipeline Pipeline Execution State Change'
+        detail:
+          pipeline:
+            - !Sub '${ProjectName}-infra-pipeline-${Environment}'
+          state:
+            - SUCCEEDED
+            - FAILED
+            - STOPPED
+      Targets:
+        - Id: PipelineReleaseTarget
+          Arn: !GetAtt PipelineReleaseFunction.Arn
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  AppPipelineName:
+    Description: App CodePipeline pipeline name.
+    Value: !Ref AppPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-AppPipelineName'
+
+  AppValidateProjectName:
+    Description: App Validate stage CodeBuild project — for manual re-runs and log access.
+    Value: !Ref AppValidateProject
+    Export:
+      Name: !Sub '${AWS::StackName}-AppValidateProjectName'
+
+  AppTestProjectName:
+    Description: App Test stage CodeBuild project — for manual re-runs and log access.
+    Value: !Ref AppTestProject
+    Export:
+      Name: !Sub '${AWS::StackName}-AppTestProjectName'
+
+  AppDeployProjectName:
+    Description: App Deploy stage CodeBuild project — for manual re-runs and log access.
+    Value: !Ref AppDeployProject
+    Export:
+      Name: !Sub '${AWS::StackName}-AppDeployProjectName'
+
+  AppValidateDeploymentProjectName:
+    Description: App ValidateDeployment stage CodeBuild project — for manual re-runs and log access.
+    Value: !Ref AppValidateDeploymentProject
+    Export:
+      Name: !Sub '${AWS::StackName}-AppValidateDeploymentProjectName'
+
+  AppDeployApprovalTopicArn:
+    Description: >
+      SNS topic for App deploy approval requests. Subscribe your email:
+        aws sns subscribe --topic-arn <this ARN> \
+          --protocol email --notification-endpoint you@example.com
+    Value: !Ref AppDeployApprovalTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AppDeployApprovalTopicArn'
+
+  PipelineReleaseFunctionArn:
+    Description: Pipeline release Lambda ARN — inspect logs at /aws/lambda/{name} for release decisions.
+    Value: !GetAtt PipelineReleaseFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineReleaseFunctionArn'
+
+  AppDeploySecondaryProjectName:
+    Condition: HasSecondaryDeploy
+    Description: DeploySecondary stage CodeBuild project — for manual re-runs and log access.
+    Value: !Ref AppDeploySecondaryProject
+    Export:
+      Name: !Sub '${AWS::StackName}-AppDeploySecondaryProjectName'

@@ -1,0 +1,65 @@
+version: 0.2
+
+# Stage: DeploySecondary (App pipeline)
+# Publishes the Lambda code AppDeployProject just built/uploaded to the
+# primary bucket, copies it to the multi-region failover region, and shifts
+# traffic via the same CodeDeploy canary mechanism (scripts/deploy-canary.sh
+# resolves its own region explicitly: AWS_DEFAULT_REGION set below wins over
+# CodeBuild's own auto-injected AWS_REGION, which is always us-east-1 - the
+# region this CodeBuild *project* runs in, regardless of which region its
+# commands target. Learned the hard way on 2026-07-29: an earlier version of
+# deploy-canary.sh took no --region flags at all and relied on ambient
+# region resolution, which silently favored CodeBuild's auto-injected
+# AWS_REGION over this project's AWS_DEFAULT_REGION and shifted PRIMARY's
+# alias instead of secondary's. Every AWS CLI call in deploy-canary.sh now
+# passes --region explicitly, sourced from this AWS_DEFAULT_REGION).
+#
+# Deliberately does NOT sync the frontend or invalidate CloudFront, and does
+# NOT set Provisioned Concurrency — those stay primary-region-only (see
+# docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md §0.2/§4.3: a
+# cold start on the standby region is a rounding error against the 60-90s
+# RTO, not worth the added cost).
+#
+# Environment variables injected by the AppDeploySecondaryProject CodeBuild project:
+#   ARTIFACTS_BUCKET           — primary region's bucket (source of the ZIP
+#                                AppDeployProject just uploaded this run)
+#   SECONDARY_ARTIFACTS_BUCKET — secondary region's own bucket (Lambda code
+#                                must be in the same region as the function)
+#   LAMBDA_FUNCTION_NAME       — same function name in both regions
+#   SECONDARY_REGION           — us-west-2
+#   ENVIRONMENT                — production | staging
+
+env:
+  variables:
+    PRIMARY_REGION: "us-east-1"
+
+phases:
+
+  build:
+    commands:
+      - echo "=== Copy the just-built Lambda ZIP to the secondary region's bucket ==="
+      - |
+        aws s3 cp "s3://$ARTIFACTS_BUCKET/lambda/lambda.zip" /tmp/lambda.zip --region "$PRIMARY_REGION"
+        aws s3 cp /tmp/lambda.zip "s3://$SECONDARY_ARTIFACTS_BUCKET/lambda/lambda.zip" --region "$SECONDARY_REGION"
+
+      - echo "=== Publish the new Lambda version in the secondary region ==="
+      - |
+        NEW_VERSION=$(aws lambda update-function-code \
+          --region "$SECONDARY_REGION" \
+          --function-name "$LAMBDA_FUNCTION_NAME" \
+          --s3-bucket "$SECONDARY_ARTIFACTS_BUCKET" \
+          --s3-key lambda/lambda.zip \
+          --publish --query 'Version' --output text)
+        echo "Published secondary-region Lambda version: $NEW_VERSION"
+        aws lambda wait function-updated --region "$SECONDARY_REGION" --function-name "$LAMBDA_FUNCTION_NAME"
+
+      - echo "=== Shift traffic via CodeDeploy canary (secondary region) ==="
+      - TARGET_VERSION="$NEW_VERSION" bash scripts/deploy-canary.sh
+
+  post_build:
+    commands:
+      - |
+        echo "=== Secondary (us-west-2) app deployment summary ==="
+        echo "  Region = $SECONDARY_REGION"
+        echo "  Lambda = $LAMBDA_FUNCTION_NAME"
+        echo "Build $CODEBUILD_BUILD_NUMBER complete."

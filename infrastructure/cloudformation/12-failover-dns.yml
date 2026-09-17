@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — Route 53 Failover Routing for
+  api.weather.craftingnewtech.com. Deployed standalone under operator
+  credentials, not through the Infra pipeline's CloudFormationDeployRole —
+  same posture as 00-bootstrap.yml and 11-audit.yml, so this survives if the
+  application stack is ever torn down (network-security-baseline.md).
+  Takes both regions' regional API domain outputs as plain parameters — a
+  single CloudFormation stack cannot GetAtt/ImportValue across regions, so
+  these are captured from each region's own stack output first (see
+  docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md §3.2).
+
+Parameters:
+
+  HostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID for craftingnewtech.com.
+
+  ApiFqdn:
+    Type: String
+    Default: api.weather.craftingnewtech.com
+
+  PrimaryDomainName:
+    Type: String
+    Description: >
+      Primary region's API Gateway regional domain name (from
+      weather-dashboard-master-production's ApiRegionalDomainName output).
+      Used ONLY as the Route 53 ALIAS target - never as the health check's
+      FullyQualifiedDomainName. API Gateway custom-domain regional targets
+      route by Host header/SNI, so curling this hostname directly (as a
+      health checker does) sends the wrong Host header and 404s - confirmed
+      live. See PrimaryHealthCheckDomainName below for the actual check target.
+
+  PrimaryHealthCheckDomainName:
+    Type: String
+    Description: >
+      Primary region's RAW execute-api hostname (no scheme) - e.g.
+      876mh0k6q1.execute-api.us-east-1.amazonaws.com, from
+      weather-dashboard-master-production's ApiEndpoint output with the
+      https:// prefix stripped. This is what the health check actually
+      polls - it isn't gated by custom-domain Host-header matching, and its
+      TLS cert matches its own hostname (unlike the regional domain name
+      above, which is a different name than what a checker connects to it as).
+
+  PrimaryHostedZoneId:
+    Type: String
+    Description: >
+      Hosted zone ID for the primary regional domain target above (from
+      the same stack's ApiRegionalHostedZoneId output).
+
+  SecondaryDomainName:
+    Type: String
+    Description: >
+      Secondary region's API Gateway regional domain name (from
+      weather-dashboard-secondary-production's ApiRegionalDomainName output).
+
+  SecondaryHostedZoneId:
+    Type: String
+    Description: >
+      Hosted zone ID for the secondary regional domain target above (from
+      the same stack's ApiRegionalHostedZoneId output).
+
+Resources:
+
+  # ── Health Check ───────────────────────────────────────────────────────────
+  # Polls the primary region's own /health route (Phase 1, task 1.1) every
+  # 30s; 3 consecutive failures flips DNS to the secondary record below.
+  PrimaryHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTPS
+        FullyQualifiedDomainName: !Ref PrimaryHealthCheckDomainName
+        Port: 443
+        ResourcePath: /health
+        RequestInterval: 30
+        FailureThreshold: 3
+      HealthCheckTags:
+        - Key: Project
+          Value: weather-dashboard
+        - Key: Environment
+          Value: production
+
+  # ── Failover Routing — Primary ────────────────────────────────────────────
+  PrimaryRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ApiFqdn
+      Type: A
+      SetIdentifier: primary
+      Failover: PRIMARY
+      HealthCheckId: !Ref PrimaryHealthCheck
+      AliasTarget:
+        DNSName: !Ref PrimaryDomainName
+        HostedZoneId: !Ref PrimaryHostedZoneId
+        EvaluateTargetHealth: false
+
+  # ── Failover Routing — Secondary ───────────────────────────────────────────
+  # No HealthCheckId here on purpose — AWS's documented Failover routing
+  # pattern only requires (and only supports) a health check on the PRIMARY
+  # record; Route 53 activates this record automatically whenever the
+  # primary's health check fails, without needing its own check.
+  SecondaryRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ApiFqdn
+      Type: A
+      SetIdentifier: secondary
+      Failover: SECONDARY
+      AliasTarget:
+        DNSName: !Ref SecondaryDomainName
+        HostedZoneId: !Ref SecondaryHostedZoneId
+        EvaluateTargetHealth: false
+
+Outputs:
+
+  ApiFqdn:
+    Description: The failover domain — point frontend/js/config.js's API_BASE_URL here.
+    Value: !Ref ApiFqdn
+
+  HealthCheckId:
+    Description: >
+      Primary health check ID — use with `aws route53 get-health-check-status`
+      to confirm current failover state (plan §3.4/§4).
+    Value: !Ref PrimaryHealthCheck

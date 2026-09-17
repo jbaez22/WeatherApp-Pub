@@ -1,0 +1,920 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — IAM Roles and least-privilege policies.
+  Five roles: Lambda execution (DynamoDB + Secrets Manager scoped to
+  specific ARNs), CodeBuild service (build/lint/test/deploy), CodePipeline
+  service (orchestration), CloudFormation deploy (resource lifecycle), and
+  EventBridge (pipeline trigger on CodeCommit push).
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier used in resource names and tags.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment.
+
+  DynamoDBTableArn:
+    Type: String
+    Description: >
+      Full ARN of the WeatherCache DynamoDB table (from 04-database stack
+      output TableArn). Scopes Lambda DynamoDB access to this table only.
+
+  ArtifactsBucketArn:
+    Type: String
+    Description: >
+      ARN of the S3 artifacts bucket (from 02-storage stack). Used to
+      scope CodeBuild and CodePipeline S3 permissions.
+
+  WebsiteBucketArn:
+    Type: String
+    Description: >
+      ARN of the S3 website bucket (from 02-storage stack). CodeBuild
+      syncs the built frontend here on every successful pipeline run.
+
+  SecondaryRegion:
+    Type: String
+    Default: ''
+    Description: >
+      Multi-region failover region (e.g. us-west-2). LambdaExecutionRole is
+      a global IAM entity reused unmodified by the secondary region's
+      Lambda (docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md
+      §0.2 #3) — this widens its DynamoDB/Secrets Resource ARNs to cover
+      that region's replica. Leave blank to skip (single-region deploys).
+
+  SecondaryArtifactsBucketArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of the secondary region's own artifacts bucket (from that
+      region's 00-bootstrap.yml, deployed with BucketNameSuffix — S3
+      bucket names are globally unique, so it can't share the primary
+      bucket's name/ARN). Widens InfraCodeBuildRole/AppCodeBuildRole's S3
+      access so their pipeline stages can package/upload to that bucket
+      too (docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md
+      §2.6/§2.7). Leave blank to skip.
+
+# ── Conditions ───────────────────────────────────────────────────────────────
+Conditions:
+  HasSecondaryRegion: !Not [!Equals [!Ref SecondaryRegion, '']]
+  HasSecondaryArtifactsBucket: !Not [!Equals [!Ref SecondaryArtifactsBucketArn, '']]
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Lambda Execution Role ──────────────────────────────────────────────────
+  # Minimal permissions: CloudWatch Logs (managed policy), DynamoDB cache
+  # read/write on this table only, SSM GetParameter on this param only.
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # Phase 3 — X-Ray active tracing (patch_all() in weather_handler.py
+        # sends DynamoDB + OWM HTTP segments).
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBCacheAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                # LambdaExecutionRole is a global IAM entity, reused
+                # unmodified by the secondary region's Lambda once the
+                # multi-region plan's Phase 2 deploys it there. DynamoDBTableArn
+                # is a literal us-east-1 ARN (04-database's TableArn output),
+                # so without the second entry the secondary Lambda gets
+                # AccessDenied reading its own local Global Tables replica —
+                # see docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md
+                # §0.2 #3 and §1.2.
+                Resource: !If
+                  - HasSecondaryRegion
+                  - - !Ref DynamoDBTableArn
+                    - !Sub 'arn:aws:dynamodb:${SecondaryRegion}:${AWS::AccountId}:table/WeatherCache'
+                  - !Ref DynamoDBTableArn
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                # Built from ProjectName (already an IamStack parameter)
+                # instead of !GetAtt SsmStack.Outputs.SecretArn — the exact
+                # ARN can't be known until the secret exists, and Secrets
+                # Manager always appends a random 6-character suffix to
+                # the name. Using GetAtt here made IamStack depend on
+                # SsmStack for its parameter, so CloudFormation had to
+                # finish updating SsmStack (creating SecretsKmsKey) BEFORE
+                # IamStack could run to grant the very KMS permissions
+                # SsmStack needed to do that — a real circular deadlock,
+                # found via two live deploy failures, not caught by any
+                # local validation. The wildcard suffix here is the
+                # standard, AWS-documented way to scope a policy to a
+                # secret before/without knowing its generated ARN suffix.
+                #
+                # ${AWS::Region} resolves to us-east-1 (IamStack is only ever
+                # deployed there) — the second, explicit entry below covers
+                # the secondary region's secret replica once it exists, for
+                # the same reason as DynamoDBCacheAccess above.
+                Resource: !If
+                  - HasSecondaryRegion
+                  - - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/openweathermap-api-key-*'
+                    - !Sub 'arn:aws:secretsmanager:${SecondaryRegion}:${AWS::AccountId}:secret:${ProjectName}/openweathermap-api-key-*'
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/openweathermap-api-key-*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Infra CodeBuild Service Role ───────────────────────────────────────────
+  # Renamed from CodeBuildServiceRole. Trimmed to its final Infra-only Sids
+  # in Deploy B — AppCodeBuildRole (below) now owns WebsiteBucketSync,
+  # TestReports, LambdaUpdateCode, CloudFrontInvalidation, and
+  # CodeDeployTrafficShift via the App pipeline's CodeBuild projects.
+  # See docs/WeatherApp-PipeSplit-ImplePlan-V1.md Deploy B / §B.1.
+  InfraCodeBuildRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: "Infra CodeBuild role writes to S3 and manages CFN stacks - all actions scoped to project-specific ARNs where the AWS API supports it"
+    Properties:
+      RoleName: !Sub '${ProjectName}-infra-codebuild-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InfraCodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}*:*'
+              - Sid: ArtifactsBucketObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !If
+                  - HasSecondaryArtifactsBucket
+                  - - !Sub '${ArtifactsBucketArn}/*'
+                    - !Sub '${SecondaryArtifactsBucketArn}/*'
+                  - !Sub '${ArtifactsBucketArn}/*'
+              - Sid: ArtifactsBucketList
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !If
+                  - HasSecondaryArtifactsBucket
+                  - - !Ref ArtifactsBucketArn
+                    - !Ref SecondaryArtifactsBucketArn
+                  - !Ref ArtifactsBucketArn
+              # cloudformation:ValidateTemplate and the two drift-status
+              # actions have no resource-level constraint in the AWS IAM
+              # reference for CloudFormation — Resource: '*' is required,
+              # not a scoping shortcut.
+              - Sid: CloudFormationOps
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:GetTemplateSummary
+                  # For validate-infra-deployment.yml's drift check.
+                  # DetectStackDrift alone is not enough - the API
+                  # internally checks each resource via
+                  # DetectStackResourceDrift too, and IAM enforces that as
+                  # a separate action. Missing it caused a real pipeline
+                  # run to fail with AccessDeniedException even though
+                  # DetectStackDrift itself was granted - found via a real
+                  # ValidateDeployment run, not caught by review before
+                  # deploying Deploy B. See
+                  # docs/WeatherApp-PipeSplit-ImplePlan-V1.md for the writeup.
+                  - cloudformation:DetectStackDrift
+                  - cloudformation:DetectStackResourceDrift
+                  - cloudformation:DescribeStackDriftDetectionStatus
+                  - cloudformation:DescribeStackResourceDrifts
+                Resource: '*'
+              - Sid: PassCfnDeployRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-cfn-deploy-role-${Environment}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── App CodeBuild Service Role ─────────────────────────────────────────────
+  # Covers: CloudWatch Logs (app-pipeline build logs), S3 (artifacts + website
+  # sync), Lambda (update code, alias, PC), CloudFront (invalidation),
+  # CodeDeploy (canary traffic shift). No CloudFormation or IAM PassRole
+  # actions — those stay Infra-only. Unused until the App pipeline
+  # (08b-app-pipeline.yml) references it — safe to create ahead of time.
+  # See docs/WeatherApp-PipeSplit-ImplePlan-V1.md Deploy A / §A.1.
+  AppCodeBuildRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: "App CodeBuild role writes to S3, Lambda, and CloudFront — all actions are scoped to project-specific ARNs, not Resource: *"
+    Properties:
+      RoleName: !Sub '${ProjectName}-app-codebuild-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppCodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-app*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-app*:*'
+              - Sid: ArtifactsBucketObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !If
+                  - HasSecondaryArtifactsBucket
+                  - - !Sub '${ArtifactsBucketArn}/*'
+                    - !Sub '${SecondaryArtifactsBucketArn}/*'
+                  - !Sub '${ArtifactsBucketArn}/*'
+              - Sid: ArtifactsBucketList
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !If
+                  - HasSecondaryArtifactsBucket
+                  - - !Ref ArtifactsBucketArn
+                    - !Ref SecondaryArtifactsBucketArn
+                  - !Ref ArtifactsBucketArn
+              - Sid: WebsiteBucketSync
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Ref WebsiteBucketArn
+                  - !Sub '${WebsiteBucketArn}/*'
+              - Sid: TestReports
+                Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource:
+                  - !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${ProjectName}-*'
+              - Sid: LambdaUpdateCode
+                Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:PublishVersion
+                  - lambda:UpdateAlias
+                  - lambda:GetAlias
+                  - lambda:PutProvisionedConcurrencyConfig
+                  - lambda:GetProvisionedConcurrencyConfig
+                  - lambda:ListVersionsByFunction
+                # Same region-pinning gotcha as LambdaExecutionRole's own
+                # DynamoDB/Secrets Sids (01-iam.yml SecondaryRegion param,
+                # plan section 0.2 #3/#9) - found live via
+                # AppDeploySecondaryProject's first real run: AccessDenied
+                # calling UpdateFunctionCode against the us-west-2 function,
+                # since ${AWS::Region} only ever resolves to us-east-1 here.
+                Resource: !If
+                  - HasSecondaryRegion
+                  - - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-*'
+                    - !Sub 'arn:aws:lambda:${SecondaryRegion}:${AWS::AccountId}:function:${ProjectName}-*'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-*'
+              - Sid: CloudFrontInvalidation
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                  - cloudfront:GetInvalidation
+                  - cloudfront:ListInvalidations
+                Resource: '*'
+              - Sid: ReadLambdaLogsForValidation
+                Effect: Allow
+                # pipeline/scripts/validate-live-deployment.sh queries the
+                # Lambda's own log group post-deploy to confirm a live
+                # OpenWeatherMap fetch actually happened (not just that
+                # DynamoDB returned a plausible cached response). Only
+                # FilterLogEvents is needed - no write/delete actions.
+                Action:
+                  - logs:FilterLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-handler-*'
+              - Sid: CodeDeployTrafficShift
+                Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:GetApplication
+                  - codedeploy:GetDeploymentGroup
+                  - codedeploy:StopDeployment
+                  - codedeploy:RegisterApplicationRevision
+                # Same region-pinning fix as LambdaUpdateCode above -
+                # scripts/deploy-canary.sh (invoked by
+                # AppDeploySecondaryProject) needs these against the
+                # us-west-2 CodeDeploy application too.
+                Resource: !If
+                  - HasSecondaryRegion
+                  - - !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${ProjectName}-*'
+                    - !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ProjectName}-*/*'
+                    - !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:*'
+                    - !Sub 'arn:aws:codedeploy:${SecondaryRegion}:${AWS::AccountId}:application:${ProjectName}-*'
+                    - !Sub 'arn:aws:codedeploy:${SecondaryRegion}:${AWS::AccountId}:deploymentgroup:${ProjectName}-*/*'
+                    - !Sub 'arn:aws:codedeploy:${SecondaryRegion}:${AWS::AccountId}:deploymentconfig:*'
+                  - - !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${ProjectName}-*'
+                    - !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ProjectName}-*/*'
+                    - !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── CodePipeline Service Role ──────────────────────────────────────────────
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codepipeline-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ArtifactStore
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                Resource:
+                  - !Ref ArtifactsBucketArn
+                  - !Sub '${ArtifactsBucketArn}/*'
+              - Sid: CodeBuildActions
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:BatchGetBuildBatches
+                  - codebuild:StartBuildBatch
+                Resource:
+                  - !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${ProjectName}-*'
+              - Sid: CodeCommitSource
+                Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                Resource:
+                  - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${ProjectName}'
+              # Covers both split CodeBuild roles from day one (Deploy A) —
+              # AppCodeBuildRole is unused until Deploy B, but pre-granting
+              # PassRole for it now is inert and keeps Deploy B's IAM diff
+              # limited to InfraCodeBuildRole's Sid trim.
+              - Sid: PassRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-infra-codebuild-role-${Environment}'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-app-codebuild-role-${Environment}'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-cfn-deploy-role-${Environment}'
+              # Phase 1.3 — the ApproveDeploy stage's Manual approval action
+              # publishes an SNS notification when it starts. Scoped to the
+              # exact topic names (08-pipeline.yml's DeployApprovalTopic and
+              # 08b-app-pipeline.yml's AppDeployApprovalTopic) rather than
+              # threaded in as parameters — IamStack deploys before
+              # PipelineStack/AppPipelineStack in master.yml, so neither
+              # topic's real ARN is available yet when this role is created.
+              # Missing the App topic here caused the App pipeline's
+              # ApproveDeploy action to fail outright with a PermissionError
+              # (found via a real pipeline run, not caught by review before
+              # deploying Deploy B) - see
+              # docs/WeatherApp-PipeSplit-ImplePlan-V1.md for the writeup.
+              - Sid: SnsApprovalPublish
+                Effect: Allow
+                Action: sns:Publish
+                Resource:
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-deploy-approval-${Environment}'
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-app-deploy-approval-${Environment}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── CloudFormation Deploy Role ─────────────────────────────────────────────
+  # Assumed by CloudFormation when creating/updating/deleting stacks.
+  # Covers every resource type managed across all CFN stacks in this project.
+  CloudFormationDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_108
+            comment: "CFN deploy role requires broad data access to create/update all stack resources — accepted risk for any IaC deployment role"
+          - id: CKV_AWS_109
+            comment: "CFN deploy role requires IAM permissions to create roles/policies for nested stacks — scoped to project resource ARNs"
+          - id: CKV_AWS_110
+            comment: "CFN deploy role requires IAM PassRole — necessary to assign execution roles to Lambda and CodeBuild during stack deployment"
+          - id: CKV_AWS_111
+            comment: "CFN deploy role requires write access across all managed service types — scope is limited to project ARN patterns"
+    Properties:
+      RoleName: !Sub '${ProjectName}-cfn-deploy-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudFormationDeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AppResources
+                Effect: Allow
+                Action:
+                  - apigateway:DELETE
+                  - apigateway:GET
+                  - apigateway:PATCH
+                  - apigateway:POST
+                  - apigateway:PUT
+                  - acm:AddTagsToCertificate
+                  - acm:DeleteCertificate
+                  - acm:DescribeCertificate
+                  - acm:ListCertificates
+                  - acm:RequestCertificate
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:DescribeStacks
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:UpdateStack
+                  - cloudfront:CreateDistribution
+                  - cloudfront:CreateFunction
+                  - cloudfront:CreateOriginAccessControl
+                  - cloudfront:CreateResponseHeadersPolicy
+                  - cloudfront:DeleteDistribution
+                  - cloudfront:DeleteFunction
+                  - cloudfront:DeleteOriginAccessControl
+                  - cloudfront:DeleteResponseHeadersPolicy
+                  - cloudfront:GetDistribution
+                  - cloudfront:GetFunction
+                  - cloudfront:GetOriginAccessControl
+                  - cloudfront:GetResponseHeadersPolicy
+                  - cloudfront:TagResource
+                  - cloudfront:UntagResource
+                  - cloudfront:UpdateDistribution
+                  - cloudfront:UpdateFunction
+                  - cloudfront:UpdateResponseHeadersPolicy
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DeleteDashboards
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:ListTagsForResource
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:TagResource
+                  - codecommit:CreateRepository
+                  - codecommit:DeleteRepository
+                  - codecommit:GetRepository
+                  - codecommit:ListRepositories
+                  - codecommit:TagResource
+                  - codebuild:BatchGetProjects
+                  - codebuild:CreateProject
+                  - codebuild:DeleteProject
+                  - codebuild:UpdateProject
+                  - codepipeline:CreatePipeline
+                  - codepipeline:DeletePipeline
+                  - codepipeline:GetPipeline
+                  - codepipeline:TagResource
+                  - codepipeline:UpdatePipeline
+                  - dynamodb:CreateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:DescribeTable
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:TagResource
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:UpdateTable
+                  - dynamodb:UpdateTimeToLive
+                  - events:DeleteRule
+                  - events:DescribeRule
+                  - events:ListTargetsByRule
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                  - events:TagResource
+                  - lambda:AddPermission
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:ListVersionsByFunction
+                  - lambda:PublishVersion
+                  - lambda:PutFunctionConcurrency
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  # Lambda alias + Provisioned Concurrency (Phase 2.1)
+                  - lambda:CreateAlias
+                  - lambda:UpdateAlias
+                  - lambda:GetAlias
+                  - lambda:DeleteAlias
+                  - lambda:PutProvisionedConcurrencyConfig
+                  - lambda:GetProvisionedConcurrencyConfig
+                  - lambda:DeleteProvisionedConcurrencyConfig
+                  # CodeDeploy blue/green (Phase 2.2)
+                  - codedeploy:CreateApplication
+                  - codedeploy:DeleteApplication
+                  - codedeploy:GetApplication
+                  - codedeploy:CreateDeploymentGroup
+                  - codedeploy:DeleteDeploymentGroup
+                  - codedeploy:GetDeploymentGroup
+                  - codedeploy:UpdateDeploymentGroup
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:TagResource
+                  - codedeploy:ListTagsForResource
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:DeleteRetentionPolicy
+                  - logs:DescribeLogGroups
+                  - logs:ListTagsLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:TagLogGroup
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetChange
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:DeleteBucketPolicy
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                  - s3:GetBucketLogging
+                  - s3:GetBucketOwnershipControls
+                  - s3:GetBucketPolicy
+                  - s3:GetBucketVersioning
+                  - s3:GetEncryptionConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutBucketLogging
+                  - s3:PutBucketOwnershipControls
+                  - s3:PutBucketPolicy
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:PutBucketVersioning
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutLifecycleConfiguration
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetTopicAttributes
+                  - sns:SetTopicAttributes
+                  - sns:TagResource
+                  # Secrets Manager (Phase 4.2)
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:TagResource
+                  - secretsmanager:UntagResource
+                  # KMS (Phase 4.2) — CloudFormationDeployRole had zero KMS
+                  # actions before this; found via a real Deploy stage
+                  # failure (UnauthorizedTaggingOperation creating
+                  # SecretsKmsKey) since Phase 4.1's CloudTrailKmsKey was
+                  # deployed under operator credentials, not this role, so
+                  # this is the first time the pipeline itself has ever
+                  # created a KMS key.
+                  - kms:CreateKey
+                  - kms:DescribeKey
+                  - kms:EnableKeyRotation
+                  - kms:PutKeyPolicy
+                  - kms:GetKeyPolicy
+                  - kms:TagResource
+                  - kms:UntagResource
+                  - kms:ScheduleKeyDeletion
+                  - kms:CreateAlias
+                  - kms:DeleteAlias
+                  - kms:UpdateAlias
+                  - secretsmanager:RotateSecret
+                  - secretsmanager:CancelRotateSecret
+                  # Multi-region native replication (ReplicaRegions property
+                  # on ApiKeySecret, 07-ssm.yml). Found via a real deploy
+                  # failure — AccessDenied on ReplicateSecretToRegions, then
+                  # again on RemoveRegionsFromReplication during the
+                  # resulting automatic rollback (which stuck the whole
+                  # stack in UPDATE_ROLLBACK_FAILED until this was granted).
+                  # Neither action is covered by any of the other
+                  # secretsmanager:* actions already granted above.
+                  - secretsmanager:ReplicateSecretToRegions
+                  - secretsmanager:RemoveRegionsFromReplication
+                Resource: '*'
+              # AWS::SecretsManager::RotationSchedule needs the deploying
+              # principal itself to hold lambda:InvokeFunction on the
+              # rotation function — separate from RotationInvokePermission
+              # in 07-ssm.yml, which only grants the SecretsManager
+              # *service principal* runtime invoke access. Without this,
+              # RotationSchedule creation fails: "Access to Lambda function
+              # ... is not allowed. You must have the permission
+              # lambda:InvokeFunction to associate this function with this
+              # secret." Found on a real deploy attempt, not documented in
+              # the plan doc. Scoped to the one rotation function only.
+              - Sid: InvokeRotationFunction
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-key-rotation-${Environment}'
+              # IAM scoped to this project's own roles only
+              - Sid: IamRoleManagement
+                Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Pipeline Filter Lambda Role ───────────────────────────────────────────
+  # Assumed by the docs-filter Lambda in 08-pipeline.yml.
+  # Reads CodeCommit diffs to decide whether a push warrants a pipeline run.
+  PipelineFilterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline-filter-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeCommitDiffRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetDifferences
+                  - codecommit:GetCommit
+                Resource:
+                  - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${ProjectName}'
+        # Covers both pipeline ARNs from day one (Deploy A) — the App
+        # pipeline doesn't exist yet, but IAM doesn't validate target
+        # existence, so this is inert until Deploy B's filter Lambda code
+        # actually routes to it.
+        - PolicyName: StartPipelineOnCodeChange
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StartPipelineExecution
+                Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource:
+                  - !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${ProjectName}-infra-pipeline-${Environment}'
+                  - !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${ProjectName}-app-pipeline-${Environment}'
+        # New — writes the pending-release flag when a commit touches both
+        # infra and app paths. Inert until Deploy B's filter Lambda code
+        # actually calls ssm:PutParameter.
+        - PolicyName: PipelineCoordinationWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/pipeline-coordination/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Pipeline Release Lambda Role ───────────────────────────────────────────
+  # Assumed by the release Lambda created in Deploy B (08b-app-pipeline.yml).
+  # Reads/deletes one SSM parameter, starts one pipeline. Created here (Deploy
+  # A) since a role with no attached Lambda yet is inert.
+  # See docs/WeatherApp-PipeSplit-ImplePlan-V1.md Deploy A / §A.2.
+  PipelineReleaseLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline-release-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PipelineCoordinationRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:DeleteParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/pipeline-coordination/*'
+        - PolicyName: StartAppPipelineOnRelease
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource:
+                  - !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${ProjectName}-app-pipeline-${Environment}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── EventBridge Role (CodeCommit → Pipeline trigger) ──────────────────────
+  # Scoped to StartPipelineExecution on this project's pipeline only.
+  # Retained for reference; EventBridge now targets the filter Lambda instead.
+  EventBridgePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-events-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartPipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource:
+                  - !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${ProjectName}-infra-pipeline-${Environment}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  LambdaExecutionRoleArn:
+    Description: Lambda execution role ARN — passed to 05-backend.yml.
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  InfraCodeBuildRoleArn:
+    Description: Infra CodeBuild role ARN — passed to 08-pipeline.yml.
+    Value: !GetAtt InfraCodeBuildRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InfraCodeBuildRoleArn'
+
+  AppCodeBuildRoleArn:
+    Description: App CodeBuild role ARN — passed to 08b-app-pipeline.yml (Deploy B).
+    Value: !GetAtt AppCodeBuildRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AppCodeBuildRoleArn'
+
+  PipelineReleaseLambdaRoleArn:
+    Description: Pipeline release Lambda role ARN — passed to 08b-app-pipeline.yml (Deploy B).
+    Value: !GetAtt PipelineReleaseLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineReleaseLambdaRoleArn'
+
+  CodePipelineServiceRoleArn:
+    Description: CodePipeline service role ARN — passed to 08-pipeline.yml.
+    Value: !GetAtt CodePipelineServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodePipelineServiceRoleArn'
+
+  CloudFormationDeployRoleArn:
+    Description: >
+      CloudFormation deploy role ARN — CodeBuild passes this via
+      `--role-arn` when running `aws cloudformation deploy`.
+    Value: !GetAtt CloudFormationDeployRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFormationDeployRoleArn'
+
+  PipelineFilterLambdaRoleArn:
+    Description: Pipeline filter Lambda role ARN — passed to 08-pipeline.yml.
+    Value: !GetAtt PipelineFilterLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineFilterLambdaRoleArn'
+
+  EventBridgePipelineRoleArn:
+    Description: EventBridge trigger role ARN — retained for reference.
+    Value: !GetAtt EventBridgePipelineRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgePipelineRoleArn'

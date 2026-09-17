@@ -1,0 +1,26 @@
+# AppSpec reference — Phase 2.2 Blue/Green CodeDeploy traffic shifting.
+#
+# This file documents the shape of the CodeDeploy AppSpec used for this
+# project's Lambda blue/green deployments — it is NOT read or templated by
+# scripts/deploy-canary.sh at deploy time. The script constructs the same
+# structure directly as JSON via Python's stdlib `json` module instead of
+# substituting placeholders into this YAML file and shipping it as text,
+# because the pre/post-traffic hook Lambdas (infrastructure/cloudformation/
+# 05-backend.yml) parse the deployment's AppSpec content with `json.loads()`
+# to find the target version — AWS Lambda's Python 3.11 runtime does not
+# include PyYAML, so the content CodeDeploy actually receives must be JSON
+# text, not YAML text, even though CodeDeploy's AppSpec format nominally
+# accepts either. Keep this file in sync with scripts/deploy-canary.sh's
+# `_build_appspec_json` if you change the shape.
+version: 0.0
+Resources:
+  - WeatherHandlerFunction:
+      Type: AWS::Lambda::Function
+      Properties:
+        Name: weather-dashboard-handler-production
+        Alias: live
+        CurrentVersion: <CURRENT_VERSION>   # replaced by deploy-canary.sh
+        TargetVersion: <TARGET_VERSION>     # replaced by deploy-canary.sh
+Hooks:
+  - BeforeAllowTraffic: weather-dashboard-pre-traffic-hook-production
+  - AfterAllowTraffic: weather-dashboard-post-traffic-hook-production

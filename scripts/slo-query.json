@@ -1,0 +1,53 @@
+[
+  {
+    "Id": "e1",
+    "Expression": "100*(m1+m2)/m3",
+    "Label": "Error Rate %",
+    "Period": 2592000
+  },
+  {
+    "Id": "m1",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/ApiGateway",
+        "MetricName": "5XXError",
+        "Dimensions": [
+          { "Name": "ApiId", "Value": "876mh0k6q1" }
+        ]
+      },
+      "Period": 2592000,
+      "Stat": "Sum"
+    },
+    "ReturnData": false
+  },
+  {
+    "Id": "m2",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/ApiGateway",
+        "MetricName": "4XXError",
+        "Dimensions": [
+          { "Name": "ApiId", "Value": "876mh0k6q1" }
+        ]
+      },
+      "Period": 2592000,
+      "Stat": "Sum"
+    },
+    "ReturnData": false
+  },
+  {
+    "Id": "m3",
+    "MetricStat": {
+      "Metric": {
+        "Namespace": "AWS/ApiGateway",
+        "MetricName": "Count",
+        "Dimensions": [
+          { "Name": "ApiId", "Value": "876mh0k6q1" }
+        ]
+      },
+      "Period": 2592000,
+      "Stat": "Sum"
+    },
+    "ReturnData": false
+  }
+]

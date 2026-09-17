@@ -1,0 +1,43 @@
+version: 0.2
+
+# Stage: Deploy (Infra pipeline)
+# Packages and deploys the 9 nested CloudFormation stacks under master.yml.
+# Never touches Lambda code, the frontend, or CloudFront — that's the App
+# pipeline's job (deploy-app.yml).
+#
+# Environment variables injected by the DeployProject CodeBuild project:
+#   ARTIFACTS_BUCKET    — S3 bucket for packaged CFN templates
+#   CFN_DEPLOY_ROLE_ARN — IAM role CloudFormation assumes when updating stacks
+#   ENVIRONMENT         — production | staging
+
+env:
+  variables:
+    STACK_NAME: "weather-dashboard-master"
+
+phases:
+
+  build:
+    commands:
+      - echo "=== Package CloudFormation nested stacks ==="
+      - |
+        aws cloudformation package \
+          --template-file infrastructure/cloudformation/master.yml \
+          --s3-bucket "$ARTIFACTS_BUCKET" \
+          --s3-prefix cloudformation \
+          --output-template-file infrastructure/cloudformation/master-packaged.yml
+
+      - echo "=== Deploy infrastructure via CloudFormation ==="
+      - bash pipeline/scripts/deploy-infrastructure.sh
+
+  post_build:
+    commands:
+      - |
+        echo "=== Infra deployment summary ==="
+        echo "  Environment = $ENVIRONMENT"
+        echo "  Stack       = $STACK_NAME-$ENVIRONMENT"
+        echo "Build $CODEBUILD_BUILD_NUMBER complete."
+
+artifacts:
+  files:
+    - infrastructure/cloudformation/master-packaged.yml
+  discard-paths: no

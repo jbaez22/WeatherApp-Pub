@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — Secondary Region (us-west-2) Stack.
+  Deploys only BackendStack + ApiStack. IAM roles, S3 buckets, CloudFront,
+  Route 53, and the CodePipelines are global or primary-region-only — see
+  docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md §0.2.
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+
+  ArtifactsBucketName:
+    Type: String
+    Description: >
+      This region's own artifacts bucket (from 00-bootstrap.yml deployed
+      here with BucketNameSuffix) — Lambda deployment packages must be
+      in the same region as the function.
+
+  LambdaZipKey:
+    Type: String
+    Default: 'lambda/lambda.zip'
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: >
+      Route 53 hosted zone for craftingnewtech.com. Enables the
+      api.weather.craftingnewtech.com regional custom domain in this
+      region (06-api.yml).
+
+  MemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024]
+
+  TimeoutSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 60
+
+  LambdaReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 1000
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+
+Resources:
+
+  # ── Lambda Backend ─────────────────────────────────────────────────────────
+  # IsPrimaryRegion=false: reuses the existing global CodeDeployRole/HookRole
+  # instead of trying to recreate them (IAM roles are account-global — see
+  # 05-backend.yml's IsPrimaryRegion parameter and plan §0.2 #2/#3).
+  BackendStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./05-backend.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        IsPrimaryRegion: 'false'
+        LambdaExecutionRoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-lambda-role-${Environment}'
+        CodeDeployRoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-codedeploy-role-${Environment}'
+        HookRoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-hook-role-${Environment}'
+        DynamoDBTableName: WeatherCache
+        SecretName: !Sub '${ProjectName}/openweathermap-api-key'
+        AllowedOrigin: 'https://weather.craftingnewtech.com'
+        ArtifactsBucketName: !Ref ArtifactsBucketName
+        LambdaZipKey: !Ref LambdaZipKey
+        MemorySize: !Ref MemorySize
+        TimeoutSeconds: !Ref TimeoutSeconds
+        ReservedConcurrency: !Ref LambdaReservedConcurrency
+        LogRetentionDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── API Gateway ────────────────────────────────────────────────────────────
+  ApiStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./06-api.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        LambdaAliasArn: !GetAtt BackendStack.Outputs.LambdaAliasArn
+        LambdaFunctionName: !GetAtt BackendStack.Outputs.LambdaFunctionName
+        AllowedOrigin: 'https://weather.craftingnewtech.com'
+        HostedZoneId: !Ref HostedZoneId
+        ApiSubdomain: 'api.weather.craftingnewtech.com'
+        LogRetentionDays: !Ref LogRetentionDays
+        # Secondary region: create the two deploy-safety alarms (lambda-errors,
+        # api-5xx) here, since MonitoringStack (which owns them in primary) is
+        # not deployed to the secondary region. See 06-api.yml's
+        # IsPrimaryRegion parameter for the full rationale.
+        IsPrimaryRegion: 'false'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+
+  ApiRegionalDomainName:
+    Description: Regional target for Route 53 Failover ALIAS records (plan §3).
+    Value: !GetAtt ApiStack.Outputs.ApiRegionalDomainName
+
+  ApiRegionalHostedZoneId:
+    Description: Hosted zone ID for the regional domain target above.
+    Value: !GetAtt ApiStack.Outputs.ApiRegionalHostedZoneId
+
+  HealthEndpoint:
+    Description: Full GET /health URL for this region — smoke test target.
+    Value: !Sub '${ApiStack.Outputs.ApiEndpoint}/health'
+
+  LambdaFunctionName:
+    Description: Lambda function name in this region.
+    Value: !GetAtt BackendStack.Outputs.LambdaFunctionName

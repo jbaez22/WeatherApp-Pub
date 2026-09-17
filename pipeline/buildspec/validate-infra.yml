@@ -1,0 +1,40 @@
+version: 0.2
+
+# Stage: Validate (Infra pipeline)
+# Gates 1-3: IaC lint, security scan, AWS syntax check. No CVE scan here -
+# that's gate 4, App-pipeline-only (backend/lambda/requirements.txt is an
+# app concern, not an infra one).
+# No deploy actions. Node.js not required; Python 3.14 only - pure static
+# analysis, so it doesn't need to match the Lambda's deployed Runtime
+# (still python3.11) the way test.yml/deploy-app.yml's packaging step does.
+
+phases:
+
+  install:
+    runtime-versions:
+      python: "3.14"
+    commands:
+      - pip install --quiet cfn-lint checkov
+
+  build:
+    on-failure: ABORT
+    commands:
+      - echo "=== Gate 1 — CloudFormation lint (cfn-lint) ==="
+      - cfn-lint infrastructure/cloudformation/*.yml
+
+      - echo "=== Gate 2 — CloudFormation security scan (checkov) ==="
+      - checkov -d infrastructure/cloudformation --framework cloudformation --quiet --compact
+
+      - echo "=== Gate 3 — AWS CloudFormation syntax validation ==="
+      - |
+        for template in infrastructure/cloudformation/*.yml; do
+          name=$(basename "$template")
+          if [ "$name" = "master.yml" ]; then
+            echo "  Skipping $name (uses local TemplateURL paths — only valid after cfn package)"
+            continue
+          fi
+          echo "  Validating $name ..."
+          aws cloudformation validate-template --template-body "file://$template" > /dev/null
+        done
+
+      - echo "All validation gates passed."

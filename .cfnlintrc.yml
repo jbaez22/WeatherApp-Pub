@@ -1,0 +1,17 @@
+# cfn-lint configuration for the Weather Dashboard project.
+# Applied automatically when cfn-lint runs from the project root.
+
+ignore_checks:
+  # W3002 — local TemplateURL paths in master.yml (e.g. ./03-cdn.yml).
+  # These are intentional inputs for `aws cloudformation package`, which
+  # replaces them with HTTPS S3 URLs before deployment. cfn-lint sees them
+  # before the package step and warns; the warning is benign.
+  - W3002
+
+  # W1030 — AcmCertificateArn parameter in 03-cdn.yml has Default: ''.
+  # The empty string is intentional: when HostedZoneId is provided,
+  # !If [AutoValidateCert, !Ref SiteCertificate, !Ref AcmCertificateArn]
+  # selects the auto-created SiteCertificate and never evaluates the empty
+  # AcmCertificateArn. cfn-lint cannot resolve the conditional branch and
+  # flags the default value against the ACM ARN pattern.
+  - W1030

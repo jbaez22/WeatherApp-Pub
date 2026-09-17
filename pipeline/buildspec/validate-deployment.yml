@@ -1,0 +1,44 @@
+version: 0.2
+
+# Stage: ValidateDeployment — runs AFTER Deploy.
+# Two layers, ~90s combined budget:
+#   1. Fast subset (~30s) of the broader pipeline/scripts/validate-e2e.sh —
+#      raw execute-api smoke test, DNS/CloudFront-independent. Confirms the
+#      Lambda update itself serves correct data.
+#   2. Cache-bypassed live validation (~60s) via
+#      pipeline/scripts/validate-live-deployment.sh — confirms the
+#      CloudFront invalidation from this deploy completed, the deployed
+#      config.js/CSP agree, and OpenWeatherMap was genuinely reached
+#      through the CUSTOM domain the real frontend calls. See
+#      docs/WeatherApp-BrowserCacheMemory-Details-V1.md section 7 — the
+#      2026-07-24 incident passed layer 1's curl-only check while
+#      completely broken for real users, which is exactly what layer 2 is
+#      for.
+#
+# No deploy actions. Python only for layer 1; layer 2 is Bash + AWS CLI.
+
+env:
+  variables:
+    TEST_CITY: "London"
+
+phases:
+
+  build:
+    on-failure: ABORT
+    commands:
+      - echo "=== Layer 1 — Post-deploy validation — GET /weather?city=$TEST_CITY ==="
+      - |
+        CODE=$(curl -s --max-time 10 -o /tmp/resp.json -w "%{http_code}" "${API_ENDPOINT}/weather?city=${TEST_CITY}")
+        [ "$CODE" = "200" ] || (echo "Expected HTTP 200, got $CODE" && cat /tmp/resp.json && exit 1)
+      - |
+        python3 -c "
+        import json
+        with open('/tmp/resp.json') as f:
+            d = json.load(f)
+        assert 'current' in d, 'missing current field'
+        assert 'temp' in d['current'].get('main', {}), 'missing current.main.temp field'
+        print('OK — current.main.temp present:', d['current']['main']['temp'])
+        "
+      - echo "Layer 1 passed."
+      - echo "=== Layer 2 — Cache-bypassed live validation ==="
+      - bash pipeline/scripts/validate-live-deployment.sh

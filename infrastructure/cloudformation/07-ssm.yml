@@ -1,0 +1,331 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — Secrets Management (AWS Secrets Manager).
+  Creates a placeholder Secrets Manager secret for the OpenWeatherMap API
+  key, a dedicated KMS key, and a 90-day rotation schedule. After
+  bootstrap, an operator sets the real value with a single AWS CLI command
+  documented in docs/deployment-guide.md. The Lambda reads the secret at
+  cold start and caches it in memory — it never appears in logs,
+  environment variables, or response payloads. (The old SSM Parameter
+  Store placeholder used before the Phase 4.2 cutover was decommissioned
+  2026-07-27 — see docs/WeatherApp-ImproveDeploys-Plan-V2.md §4.2.)
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier used in resource names and tags.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - production
+      - staging
+    Description: Deployment environment.
+
+  # Phase 4.2 — must match the SECRET_NAME env var on the Lambda function
+  # and the default in backend/lambda/ssm_secrets.py once it cuts over.
+  SecretName:
+    Type: String
+    Default: 'weather-dashboard/openweathermap-api-key'
+    Description: >
+      Secrets Manager secret name for the OpenWeatherMap API key.
+      Change only if you override SECRET_NAME on the Lambda.
+
+  ReplicaRegion:
+    Type: String
+    Default: ''
+    Description: >
+      Optional secondary region for native Secrets Manager cross-region
+      replication (docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md
+      §2.4). Leave blank to disable. The replica uses the AWS-managed key in
+      that region, not SecretsKmsKey below — KMS keys are region-scoped, and
+      a second regional CMK isn't worth the added cost/complexity for this
+      secret given IAM already scopes access tightly.
+
+# ── Conditions ───────────────────────────────────────────────────────────────
+Conditions:
+  HasReplicaRegion: !Not [!Equals [!Ref ReplicaRegion, '']]
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Secrets Manager ─────────────────────────────────────────────────────────
+  # Dedicated CMK rather than the default aws/secretsmanager key — key
+  # policy follows AWS's documented pattern for Secrets Manager CMKs: root
+  # gets full key management, and any principal in this account calling
+  # through the Secrets Manager service (scoped via kms:ViaService +
+  # kms:CallerAccount) can use it. Actual read access is still gated by
+  # the secretsmanager:GetSecretValue IAM grant on the specific secret ARN
+  # (see 01-iam.yml) — this key policy only controls who can use the key
+  # at all, not who can read this particular secret.
+  SecretsKmsKey:
+    Type: AWS::KMS::Key
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_33
+            comment: "Principal '*' is AWS's own documented Secrets Manager CMK pattern, scoped down by kms:ViaService=secretsmanager + kms:CallerAccount to this account only — not actually open to any AWS principal"
+    Properties:
+      Description: !Sub 'Secrets Manager encryption key for ${ProjectName}-${Environment}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIamUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowSecretsManagerAccessForAccountPrincipals
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:Encrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+                'kms:CallerAccount': !Ref AWS::AccountId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  SecretsKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-secrets-${Environment}'
+      TargetKeyId: !Ref SecretsKmsKey
+
+  # Placeholder value at stack-create — CloudFormation owns creation so a
+  # manual `aws secretsmanager create-secret` can never race it and
+  # conflict. Never put the real key here in plaintext in git.
+  ApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Ref SecretName
+      Description: >
+        OpenWeatherMap API key — placeholder at stack-create; set the real
+        value post-deploy via CLI, rotated every 90 days via
+        RotationSchedule below.
+      SecretString: 'PLACEHOLDER_SET_REAL_VALUE_AFTER_BOOTSTRAP'
+      KmsKeyId: !Ref SecretsKmsKey
+      ReplicaRegions: !If
+        - HasReplicaRegion
+        - - Region: !Ref ReplicaRegion
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  RotationNotificationTopic:
+    Type: AWS::SNS::Topic
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_26
+            comment: "SNS topic delivers a rotation-reminder message (no PII/secrets — the new key value is never included) — KMS adds cost without security benefit"
+    Properties:
+      TopicName: !Sub '${ProjectName}-key-rotation-${Environment}'
+      DisplayName: 'Weather Dashboard — API key rotation'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Rotation Lambda execution role ────────────────────────────────────
+  # Scoped to exactly the one secret and one SNS topic.
+  RotationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-rotation-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RotationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:UpdateSecretVersionStage
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref ApiKeySecret
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref RotationNotificationTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  RotationFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "No VPC needed — only calls AWS service APIs and the public OpenWeatherMap endpoint to validate the pending key (ADR-011 no-VPC rationale, same as the main handler)"
+          - id: CKV_AWS_116
+            comment: "Invoked synchronously by Secrets Manager's rotation contract, not async — DLQ has no effect here"
+          - id: CKV_AWS_50
+            comment: "X-Ray tracing not warranted for a rare (90-day), short-lived rotation hook"
+          - id: CKV_AWS_115
+            comment: "Reserved concurrency not set — fires only during a rotation attempt, not a traffic-driven workload"
+          - id: CKV_AWS_173
+            comment: "NOTIFY_TOPIC_ARN is a resource identifier, not sensitive data"
+    Properties:
+      FunctionName: !Sub '${ProjectName}-key-rotation-${Environment}'
+      Description: 'Secrets Manager rotation hook for the OpenWeatherMap API key — notifies an operator via SNS, since OWM has no key-generation API.'
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt RotationRole.Arn
+      Environment:
+        Variables:
+          NOTIFY_TOPIC_ARN: !Ref RotationNotificationTopic
+      Code:
+        ZipFile: |
+          # 4-stage AWS Secrets Manager rotation contract: createSecret,
+          # setSecret, testSecret, finishSecret. Because OWM keys must be
+          # generated by a human in the OWM dashboard, setSecret publishes
+          # an SNS notice and then deliberately RAISES — Secrets Manager
+          # invokes the 4 steps back-to-back within one rotation attempt,
+          # so if setSecret returned success here, testSecret would run
+          # immediately after against whatever value Secrets Manager
+          # auto-copied into AWSPENDING (the still-old key, since nothing
+          # new has been set yet), silently "succeeding" a rotation that
+          # never actually rotated anything. Raising here instead makes
+          # Secrets Manager mark the attempt Failed and stop, so the
+          # operator has to run put-secret-value on AWSPENDING with a
+          # real new key, then manually retry rotation (same
+          # ClientRequestToken) to resume at testSecret/finishSecret.
+          import json
+          import os
+          import urllib.request
+
+          import boto3
+
+          sns = boto3.client('sns')
+          secretsmanager = boto3.client('secretsmanager')
+
+          NOTIFY_TOPIC_ARN = os.environ['NOTIFY_TOPIC_ARN']
+
+
+          def handler(event, context):
+              step = event['Step']
+              secret_id = event['SecretId']
+              token = event['ClientRequestToken']
+
+              if step == 'createSecret':
+                  # No-op: the operator supplies the new value directly
+                  # (see setSecret below) — nothing to stage here.
+                  return
+
+              if step == 'setSecret':
+                  sns.publish(
+                      TopicArn=NOTIFY_TOPIC_ARN,
+                      Subject='ACTION REQUIRED: rotate OpenWeatherMap API key',
+                      Message=(
+                          'Generate a new key at https://openweathermap.org/api_keys, then run:\n'
+                          f'aws secretsmanager put-secret-value --secret-id {secret_id} '
+                          f'--version-stage AWSPENDING --client-request-token {token} '
+                          '--secret-string "<new-key>"\n\n'
+                          'Then resume rotation with:\n'
+                          f'aws secretsmanager rotate-secret --secret-id {secret_id} '
+                          f'--client-request-token {token}'
+                      ),
+                  )
+                  raise Exception(
+                      'Manual step required: waiting for operator to set the new '
+                      'key on AWSPENDING (see SNS notification), then retry rotation.'
+                  )
+
+              if step == 'testSecret':
+                  pending = secretsmanager.get_secret_value(
+                      SecretId=secret_id, VersionStage='AWSPENDING'
+                  )['SecretString']
+                  url = f'https://api.openweathermap.org/data/2.5/weather?q=London&appid={pending}'
+                  with urllib.request.urlopen(url, timeout=10) as resp:
+                      if resp.status != 200:
+                          raise Exception(f'Pending key failed live test call: HTTP {resp.status}')
+                  return
+
+              if step == 'finishSecret':
+                  secretsmanager.update_secret_version_stage(
+                      SecretId=secret_id, VersionStage='AWSCURRENT',
+                      MoveToVersionId=token,
+                  )
+                  return
+
+              raise Exception(f'Unrecognized rotation step: {step}')
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Secrets Manager must be explicitly allowed to invoke the rotation
+  # Lambda — RotationSchedule alone does not grant this. Without this
+  # resource, rotation silently fails with AccessDenied the first time
+  # Secrets Manager actually tries to run it (i.e., 90 days from now,
+  # when you're least likely to be watching).
+  RotationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RotationFunction
+      Action: lambda:InvokeFunction
+      Principal: secretsmanager.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  RotationSchedule:
+    Type: AWS::SecretsManager::RotationSchedule
+    DependsOn: RotationInvokePermission
+    Properties:
+      SecretId: !Ref ApiKeySecret
+      RotationLambdaARN: !GetAtt RotationFunction.Arn
+      RotationRules:
+        AutomaticallyAfterDays: 90
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  SecretName:
+    Description: >
+      Secrets Manager secret name — referenced by the Lambda SECRET_NAME
+      environment variable in 05-backend.yml.
+    Value: !Ref SecretName
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretName'
+
+  SecretArn:
+    Description: >
+      Full secret ARN — used in 01-iam.yml to restrict the Lambda
+      execution role to secretsmanager:GetSecretValue on this ARN only.
+    Value: !Ref ApiKeySecret
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretArn'

@@ -1,0 +1,23 @@
+version: 0.2
+
+# Stage: Validate (App pipeline)
+# Gate 4: Dependency CVE scan (pip-audit) on the Lambda's own requirements.
+# No deploy actions. Python 3.14 only - no Node.js needed for a CVE scan.
+# pip-audit only reads requirement version specifiers, so this doesn't need
+# to match the Lambda's deployed Runtime (still python3.11) either.
+
+phases:
+
+  install:
+    runtime-versions:
+      python: "3.14"
+    commands:
+      - pip install --quiet pip-audit
+
+  build:
+    on-failure: ABORT
+    commands:
+      - echo "=== Gate 4 — Dependency CVE scan (pip-audit) ==="
+      - pip-audit -r backend/lambda/requirements.txt
+
+      - echo "App validation gate passed."

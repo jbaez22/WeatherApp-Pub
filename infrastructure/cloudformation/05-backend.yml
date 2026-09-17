@@ -1,0 +1,620 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — Lambda Backend.
+  Creates the weather-handler Lambda function and its CloudWatch log group.
+  The function reads the OWM API key from Secrets Manager at cold start (cached in memory),
+  checks DynamoDB for a cached response, falls back to the OWM API on a cache
+  miss, and writes the result back to DynamoDB for the next 15 minutes.
+  Initial Lambda ZIP must be uploaded to S3 before this stack is deployed
+  (see docs/deployment-guide.md bootstrap section).
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier used in resource names and tags.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment.
+
+  LambdaExecutionRoleArn:
+    Type: String
+    Description: >
+      ARN of the Lambda execution role (from 01-iam stack output
+      LambdaExecutionRoleArn). Grants DynamoDB and Secrets Manager access.
+
+  DynamoDBTableName:
+    Type: String
+    Default: WeatherCache
+    Description: >
+      DynamoDB table name (from 04-database stack output TableName).
+      Must match backend/lambda/cache.py _TABLE_NAME constant.
+
+  SecretName:
+    Type: String
+    Default: 'weather-dashboard/openweathermap-api-key'
+    Description: >
+      Secrets Manager secret name for the OWM API key (from 07-ssm stack
+      output SecretName). Must match backend/lambda/ssm_secrets.py
+      _SECRET_NAME.
+
+  AllowedOrigin:
+    Type: String
+    Default: 'https://weather.craftingnewtech.com'
+    Description: >
+      CORS allowed origin injected via Lambda environment variable.
+      Must match the CORS config in 06-api.yml and the CloudFront
+      alternate domain. Never use a wildcard here.
+
+  ArtifactsBucketName:
+    Type: String
+    Description: >
+      S3 bucket name where the Lambda deployment ZIP is stored (from 02-storage
+      stack output ArtifactsBucketName). Bootstrap uploads lambda/lambda.zip
+      here before the first stack deployment.
+
+  LambdaZipKey:
+    Type: String
+    Default: 'lambda/lambda.zip'
+    Description: S3 key of the Lambda deployment package within ArtifactsBucketName.
+
+  MemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024]
+    Description: Lambda memory in MB. 256 MB gives enough headroom for requests+boto3.
+
+  TimeoutSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 60
+    Description: >
+      Lambda timeout in seconds. OWM API timeout is 10 s; this gives enough
+      headroom for cold starts and DynamoDB round trips.
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 1000
+    Description: >
+      Reserved concurrency cap. Protects against unexpected traffic spikes
+      driving Lambda costs; raises a 429 for excess requests (throttled by
+      API Gateway before this, but defence-in-depth).
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+    Description: CloudWatch log retention for Lambda execution logs.
+
+  IsPrimaryRegion:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      'false' when this stack is deployed as the multi-region secondary
+      (docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md §1.3). IAM
+      roles are account-global — CodeDeployRole/HookRole must not be
+      recreated under names that already exist from the primary region's
+      deploy. When 'false', CodeDeployRoleArn/HookRoleArn are used instead.
+
+  CodeDeployRoleArn:
+    Type: String
+    Default: ''
+    Description: >
+      Only used when IsPrimaryRegion=false — the existing CodeDeployRole ARN
+      from the primary region's BackendStack output.
+
+  HookRoleArn:
+    Type: String
+    Default: ''
+    Description: >
+      Only used when IsPrimaryRegion=false — the existing HookRole ARN from
+      the primary region's BackendStack output.
+
+  SecondaryRegion:
+    Type: String
+    Default: ''
+    Description: >
+      Only used when IsPrimaryRegion=true — the multi-region failover region
+      (e.g. us-west-2). CodeDeployRole is created only in the primary region
+      and reused (via CodeDeployRoleArn) in the secondary, so its
+      InvokeTrafficHooks policy must explicitly grant lambda:InvokeFunction
+      on BOTH regions' pre/post-traffic hook Lambda ARNs — !GetAtt only ever
+      resolves to the region this stack itself is deployed in. Found live
+      2026-07-29: the policy only covered primary's hook ARNs, so the first
+      real (non-bootstrap) canary deployment in the secondary region failed
+      with IAM_ROLE_PERMISSIONS; production was unaffected since it only
+      blocked the secondary sync, not the primary/live path.
+
+# ── Conditions ───────────────────────────────────────────────────────────────
+Conditions:
+  CreateRegionalRoles: !Equals [!Ref IsPrimaryRegion, 'true']
+  HasSecondaryRegion: !Not [!Equals [!Ref SecondaryRegion, '']]
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── CloudWatch Log Group ───────────────────────────────────────────────────
+  # Explicit log group with retention — Lambda would create one automatically
+  # but without a retention policy (logs accumulate indefinitely and cost money).
+  # DeletionPolicy: Retain preserves logs after a stack teardown for debugging.
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs are encrypted by default with AWS-managed keys; KMS CMK adds ~$1/month per key without meaningful benefit"
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-handler-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ── Lambda Function ────────────────────────────────────────────────────────
+  # Runtime: Python 3.11 (latest stable supported by Lambda at project start).
+  # Code is initially loaded from the artifacts S3 bucket and updated on every
+  # pipeline run via `aws lambda update-function-code` in the buildspec.
+  # ReservedConcurrentExecutions caps runaway invocations at the Lambda level
+  # (API Gateway throttling is the first line of defence).
+  WeatherHandlerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda intentionally outside VPC per ADR-011 — all services (DynamoDB, Secrets Manager, OWM) are reachable without VPC; VPC adds cold-start latency and NAT cost"
+          - id: CKV_AWS_116
+            comment: "DLQ applies to async Lambda invocations only; this function is invoked synchronously by API Gateway — DLQ has no effect here"
+          - id: CKV_AWS_173
+            comment: "Env vars are non-sensitive (LOG_LEVEL, TABLE_NAME, SECRET_NAME, ALLOWED_ORIGIN); actual secret (API key) is in Secrets Manager, not env vars"
+    Properties:
+      FunctionName: !Sub '${ProjectName}-handler-${Environment}'
+      Description: 'Fetches weather data from OWM API with DynamoDB caching (15 min TTL).'
+      Runtime: python3.11
+      Handler: weather_handler.handler
+      Role: !Ref LambdaExecutionRoleArn
+      Code:
+        S3Bucket: !Ref ArtifactsBucketName
+        S3Key: !Ref LambdaZipKey
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref TimeoutSeconds
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          TABLE_NAME: !Ref DynamoDBTableName
+          SECRET_NAME: !Ref SecretName
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      # Phase 3: X-Ray active tracing. HTTP API (v2) has no first-class
+      # TracingEnabled toggle like REST APIs — the code-level patch_all()
+      # call in weather_handler.py does the real work (DynamoDB + OWM HTTP
+      # segments), this just enables the Lambda side of the trace.
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda Alias ("live") ──────────────────────────────────────────────────
+  # Phase 2.1: API Gateway invokes this alias, not the bare function ARN, so
+  # traffic can be moved between versions without touching the API Gateway
+  # integration. FunctionVersion is pinned to the literal "$LATEST" string —
+  # AWS::Lambda::Function has no `Version` GetAtt attribute (that only
+  # exists on a separate AWS::Lambda::Version resource, which this project
+  # deliberately does not create — see note below). That's intentional and
+  # must stay that way: the buildspec's `--publish` + `update-alias` calls
+  # own the alias's real version target after bootstrap, not CloudFormation.
+  # Editing this resource block in a future CFN change risks CloudFormation
+  # reverting the alias back to $LATEST — see
+  # docs/WeatherApp-ImproveDeploys-Plan-V2.md for the full ordering-
+  # dependency writeup.
+  #
+  # No ProvisionedConcurrencyConfig here on purpose: AWS Lambda rejects
+  # Provisioned Concurrency on an alias pointing at $LATEST, which this
+  # alias does at bootstrap. PC is set via CLI in
+  # pipeline/buildspec/deploy-app.yml (App pipeline) immediately after
+  # update-alias moves it off $LATEST onto a real published version — see
+  # that file for the actual `put-provisioned-concurrency-config` call.
+  WeatherHandlerAliasLive:
+    Type: AWS::Lambda::Alias
+    UpdatePolicy:
+      CodeDeployLambdaAliasUpdate:
+        ApplicationName: !Ref WeatherCodeDeployApp
+        DeploymentGroupName: !Ref WeatherDeploymentGroup
+        BeforeAllowTrafficHook: !Ref PreTrafficHookFunction
+        AfterAllowTrafficHook: !Ref PostTrafficHookFunction
+    Properties:
+      FunctionName: !Ref WeatherHandlerFunction
+      FunctionVersion: '$LATEST'
+      Name: live
+
+  # ── Phase 2.2: Blue/Green CodeDeploy Traffic Shifting ─────────────────────
+  # Per WeatherApp-Canary-Implementation-V1.md §2.3, adapted to this
+  # project's actual alias (WeatherHandlerAliasLive above, not a separate
+  # AWS::Lambda::Version + Alias pair — see that resource's comment for why
+  # this project deliberately avoids CFN-managed Lambda versions).
+  #
+  # UpdatePolicy above only takes effect on CFN-driven alias updates; the
+  # actual traffic shift is triggered by scripts/deploy-canary.sh calling
+  # `aws deploy create-deployment` directly (Phase 2.2b), not by a
+  # CloudFormation stack update — CodeDeploy's Lambda blue/green mechanism
+  # is designed to be invoked either way, and this project's normal deploy
+  # flow is the CLI path since code changes don't go through CFN at all.
+  WeatherCodeDeployApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-${Environment}'
+      ComputePlatform: Lambda
+
+  WeatherDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref WeatherCodeDeployApp
+      DeploymentGroupName: !Sub '${ProjectName}-handler-dg-${Environment}'
+      ServiceRoleArn: !If [CreateRegionalRoles, !GetAtt CodeDeployRole.Arn, !Ref CodeDeployRoleArn]
+      DeploymentConfigName: CodeDeployDefault.LambdaCanary10Percent5Minutes
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_ALARM
+      AlarmConfiguration:
+        Enabled: true
+        Alarms:
+          # Already deployed via 09-monitoring.yml — CodeDeploy watches
+          # these during the 5-minute canary window and auto-rolls-back
+          # the alias if either fires.
+          - Name: !Sub '${ProjectName}-lambda-errors-${Environment}'
+          - Name: !Sub '${ProjectName}-api-5xx-${Environment}'
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRegionalRoles
+    Properties:
+      RoleName: !Sub '${ProjectName}-codedeploy-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda
+      Policies:
+        # AWSCodeDeployRoleForLambda's own lambda:InvokeFunction grant is
+        # scoped to function names starting with "CodeDeployHook_" only —
+        # ours don't match that prefix, so the first real (non-bootstrap)
+        # canary deployment failed with IAM_ROLE_PERMISSIONS: "does not
+        # give you permission to perform operations in ... AWSLambda."
+        # Found on a real deploy attempt (v34 -> v35), not by reading docs;
+        # production was unaffected, CodeDeploy auto-rolled back the alias.
+        #
+        # This role is created only in the primary region and reused (via
+        # CodeDeployRoleArn) in the secondary — !GetAtt below only ever
+        # resolves to hook Lambda ARNs in THIS (primary) region, so the
+        # secondary region's hook ARNs must be added explicitly via !Sub.
+        # Found live 2026-07-29: the first real (non-bootstrap) canary
+        # deployment in the secondary region hit the exact same
+        # IAM_ROLE_PERMISSIONS error as above, for the same underlying
+        # reason (missing Resource ARN), just in the other region.
+        - PolicyName: InvokeTrafficHooks
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !If
+                  - HasSecondaryRegion
+                  - - !GetAtt PreTrafficHookFunction.Arn
+                    - !GetAtt PostTrafficHookFunction.Arn
+                    - !Sub 'arn:aws:lambda:${SecondaryRegion}:${AWS::AccountId}:function:${ProjectName}-pre-traffic-hook-${Environment}'
+                    - !Sub 'arn:aws:lambda:${SecondaryRegion}:${AWS::AccountId}:function:${ProjectName}-post-traffic-hook-${Environment}'
+                  - - !GetAtt PreTrafficHookFunction.Arn
+                    - !GetAtt PostTrafficHookFunction.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Pre/Post-Traffic Hook Lambdas ─────────────────────────────────────────
+  # CodeDeploy invokes these automatically during a blue/green deployment —
+  # BeforeAllowTraffic runs once the new version is deployed but before any
+  # live traffic shifts to it; AfterAllowTraffic runs once the shift
+  # completes (100%). Both must call PutLifecycleEventHookExecutionStatus
+  # or the deployment hangs until it times out.
+  #
+  # CORRECTION vs. the source doc: the illustrative pre-traffic hook in
+  # WeatherApp-Canary-Implementation-V1.md reads `os.environ['NEW_VERSION_ARN']`,
+  # but nothing in that doc's CFN ever sets that variable — env vars are
+  # static at deploy time and CodeDeploy has no mechanism to inject a
+  # per-deployment value into them. As written, every invocation would
+  # KeyError immediately, meaning every canary deployment would fail its
+  # pre-traffic check and auto-rollback, 100% of the time. Fixed here by
+  # calling CodeDeploy's GetDeployment API to read the target version out
+  # of the deployment's own AppSpec content (the same TargetVersion that
+  # scripts/deploy-canary.sh writes into appspec-generated.yml) instead of
+  # relying on a nonexistent environment variable.
+  HookRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRegionalRoles
+    Properties:
+      RoleName: !Sub '${ProjectName}-hook-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: HookPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CodeDeployLifecycle
+                Effect: Allow
+                Action:
+                  - codedeploy:PutLifecycleEventHookExecutionStatus
+                  - codedeploy:GetDeployment
+                Resource: '*'
+              # InvokeTargetVersion and ListVersionsForTargetResolution below:
+              # HookRole is created only in the primary region and reused
+              # (via HookRoleArn) in the secondary, same pattern as
+              # CodeDeployRole above — so both Resource lists must explicitly
+              # cover the secondary region's WeatherHandlerFunction ARN too,
+              # not just whatever ${AWS::Region}/!GetAtt resolve to for
+              # THIS (primary) stack. Found live 2026-07-29 immediately
+              # after fixing CodeDeployRole's own cross-region gap: with
+              # that fix in place, the secondary canary deployment
+              # progressed past the IAM_ROLE_PERMISSIONS failure and
+              # actually invoked the pre-traffic hook for the first time
+              # ever - which is what surfaced this second, sibling gap
+              # (HOOK_EXECUTION_FAILURE / AccessDeniedException on
+              # lambda:ListVersionsByFunction in us-west-2).
+              - Sid: InvokeTargetVersion
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !If
+                  - HasSecondaryRegion
+                  - - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${WeatherHandlerFunction}:*'
+                    - !Sub 'arn:aws:lambda:${SecondaryRegion}:${AWS::AccountId}:function:${ProjectName}-handler-${Environment}:*'
+                  - - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${WeatherHandlerFunction}:*'
+              - Sid: ListVersionsForTargetResolution
+                Effect: Allow
+                Action:
+                  - lambda:ListVersionsByFunction
+                Resource: !If
+                  - HasSecondaryRegion
+                  - - !GetAtt WeatherHandlerFunction.Arn
+                    - !Sub 'arn:aws:lambda:${SecondaryRegion}:${AWS::AccountId}:function:${ProjectName}-handler-${Environment}'
+                  - - !GetAtt WeatherHandlerFunction.Arn
+              - Sid: DescribeAlarmState
+                Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PreTrafficHookFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Deployment-lifecycle hook, same no-VPC rationale as the main handler (ADR-011) — only calls AWS service APIs"
+          - id: CKV_AWS_116
+            comment: "Invoked synchronously by CodeDeploy as a lifecycle hook, not async — DLQ has no effect here"
+          - id: CKV_AWS_50
+            comment: "X-Ray tracing not warranted for a short-lived deployment-time hook"
+          - id: CKV_AWS_115
+            comment: "Reserved concurrency not set — fires once per deployment, not a traffic-driven workload"
+          - id: CKV_AWS_173
+            comment: "FUNCTION_NAME env var is a resource name, not sensitive data"
+    Properties:
+      FunctionName: !Sub '${ProjectName}-pre-traffic-hook-${Environment}'
+      Description: 'CodeDeploy BeforeAllowTraffic hook — invokes the target version with a live test payload before any real traffic shifts to it.'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !If [CreateRegionalRoles, !GetAtt HookRole.Arn, !Ref HookRoleArn]
+      Timeout: 60
+      Environment:
+        Variables:
+          FUNCTION_NAME: !Ref WeatherHandlerFunction
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          import boto3
+
+          codedeploy = boto3.client('codedeploy')
+          lambda_client = boto3.client('lambda')
+
+          FUNCTION_NAME = os.environ['FUNCTION_NAME']
+
+
+          def _target_version():
+              """Determine the version to test. CodeDeploy's GetDeployment API
+              does not echo back the AppSpec content that was used to create
+              the deployment — only a sha256 of it — so TargetVersion can't be
+              read from the deployment record itself. Found the hard way: a
+              real deployment failed with HOOK_EXECUTION_FAILURE, "'content'"
+              (KeyError), confirmed via `aws deploy get-deployment --query
+              deploymentInfo.revision`, which returned only {revisionType,
+              appSpecContent: {sha256}}. Falling back to the highest published
+              version instead — it's always the one `update-function-code
+              --publish` just created immediately before this deployment was
+              created, and deploys are serialized through a single Deploy
+              stage, so nothing else can race a concurrent publish in."""
+              versions = lambda_client.list_versions_by_function(FunctionName=FUNCTION_NAME)['Versions']
+              numbered = [int(v['Version']) for v in versions if v['Version'] != '$LATEST']
+              return str(max(numbered))
+
+
+          def handler(event, context):
+              deployment_id = event['DeploymentId']
+              hook_id = event['LifecycleEventHookExecutionId']
+              try:
+                  target_version = _target_version()
+                  response = lambda_client.invoke(
+                      FunctionName=f'{FUNCTION_NAME}:{target_version}',
+                      Payload=json.dumps({
+                          'queryStringParameters': {'city': 'London'},
+                          'routeKey': 'GET /weather',
+                      }),
+                  )
+                  payload = json.loads(response['Payload'].read())
+                  if response['StatusCode'] != 200 or payload.get('statusCode', 0) != 200:
+                      raise Exception(f'Pre-traffic check failed: {payload}')
+                  print(f'Pre-traffic check passed against version {target_version}')
+                  status = 'Succeeded'
+              except Exception as exc:
+                  print(f'Pre-traffic check failed: {exc}')
+                  status = 'Failed'
+
+              codedeploy.put_lifecycle_event_hook_execution_status(
+                  deploymentId=deployment_id,
+                  lifecycleEventHookExecutionId=hook_id,
+                  status=status,
+              )
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PostTrafficHookFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Deployment-lifecycle hook, same no-VPC rationale as the main handler (ADR-011) — only calls AWS service APIs"
+          - id: CKV_AWS_116
+            comment: "Invoked synchronously by CodeDeploy as a lifecycle hook, not async — DLQ has no effect here"
+          - id: CKV_AWS_50
+            comment: "X-Ray tracing not warranted for a short-lived deployment-time hook"
+          - id: CKV_AWS_115
+            comment: "Reserved concurrency not set — fires once per deployment, not a traffic-driven workload"
+          - id: CKV_AWS_173
+            comment: "No env vars contain sensitive data"
+    Properties:
+      FunctionName: !Sub '${ProjectName}-post-traffic-hook-${Environment}'
+      Description: 'CodeDeploy AfterAllowTraffic hook — checks the error alarm once the shift to 100% completes.'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !If [CreateRegionalRoles, !GetAtt HookRole.Arn, !Ref HookRoleArn]
+      Timeout: 60
+      Environment:
+        Variables:
+          ALARM_NAME: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      Code:
+        ZipFile: |
+          import os
+
+          import boto3
+
+          codedeploy = boto3.client('codedeploy')
+          cloudwatch = boto3.client('cloudwatch')
+
+          ALARM_NAME = os.environ['ALARM_NAME']
+
+
+          def handler(event, context):
+              deployment_id = event['DeploymentId']
+              hook_id = event['LifecycleEventHookExecutionId']
+              try:
+                  response = cloudwatch.describe_alarms(AlarmNames=[ALARM_NAME])
+                  alarm_state = response['MetricAlarms'][0]['StateValue']
+                  if alarm_state == 'ALARM':
+                      raise Exception(f'{ALARM_NAME} is in ALARM state after traffic shift')
+                  print(f'Post-traffic check passed — alarm state: {alarm_state}')
+                  status = 'Succeeded'
+              except Exception as exc:
+                  print(f'Post-traffic check failed: {exc}')
+                  status = 'Failed'
+
+              codedeploy.put_lifecycle_event_hook_execution_status(
+                  deploymentId=deployment_id,
+                  lifecycleEventHookExecutionId=hook_id,
+                  status=status,
+              )
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  LambdaFunctionArn:
+    Description: >
+      Lambda function ARN — passed to 06-api.yml to build the API Gateway
+      Lambda proxy integration URI and the Lambda::Permission SourceArn.
+    Value: !GetAtt WeatherHandlerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaFunctionName:
+    Description: >
+      Lambda function name — passed to 06-api.yml (Lambda::Permission
+      FunctionName) and 09-monitoring.yml (CloudWatch alarms).
+    Value: !Ref WeatherHandlerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaAliasArn:
+    Description: >
+      Lambda alias ("live") ARN — passed to 06-api.yml so API Gateway
+      invokes the alias instead of the bare function ARN (Phase 2.1).
+    Value: !Ref WeatherHandlerAliasLive
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaAliasArn'
+
+  LambdaLogGroupName:
+    Description: Lambda CloudWatch log group name — for reference in runbook.
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaLogGroupName'
+
+  CodeDeployApplicationName:
+    Description: >
+      CodeDeploy application name (Phase 2.2) — used by
+      scripts/deploy-canary.sh and scripts/rollback-canary.sh.
+    Value: !Ref WeatherCodeDeployApp
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeDeployApplicationName'
+
+  CodeDeployDeploymentGroupName:
+    Description: >
+      CodeDeploy deployment group name (Phase 2.2) — used by
+      scripts/deploy-canary.sh.
+    Value: !Ref WeatherDeploymentGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeDeployDeploymentGroupName'

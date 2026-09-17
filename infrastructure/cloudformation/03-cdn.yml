@@ -1,0 +1,315 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — CloudFront CDN + Origin Access Control.
+  Serves the static frontend from S3 over HTTPS using OAC (no public bucket).
+  A CloudFront Function handles directory index rewriting so /architecture/
+  serves /architecture/index.html without static website hosting.
+  The OAC bucket policy is created here (not in 02-storage.yml) because it
+  requires the CloudFront distribution ARN, which is unknown before this stack.
+  Optionally creates a Route 53 ALIAS record (set HostedZoneId to enable).
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier used in resource names and tags.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment.
+
+  WebsiteBucketName:
+    Type: String
+    Description: >
+      S3 website bucket name (from 02-storage stack output WebsiteBucketName).
+      Used in the OAC bucket policy and as the CloudFront origin ID.
+
+  WebsiteBucketDomainName:
+    Type: String
+    Description: >
+      S3 regional domain name for the website bucket (from 02-storage stack
+      output WebsiteBucketDomainName). CloudFront uses this as the origin
+      domain — must be the REST endpoint, not the website endpoint.
+
+  AcmCertificateArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of a pre-existing ACM certificate for the alternate domain.
+      MUST be in us-east-1. Only required when HostedZoneId is NOT provided
+      (i.e. the domain is managed outside Route 53).
+      When HostedZoneId IS provided, CloudFormation creates and validates the
+      certificate automatically via AWS::CertificateManager::Certificate —
+      leave this blank in that case.
+
+  AlternateDomainName:
+    Type: String
+    Default: 'weather.craftingnewtech.com'
+    Description: Custom domain that CloudFront serves. Must match the ACM cert.
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: >
+      Route 53 hosted zone ID for craftingnewtech.com. When provided:
+        1. CloudFormation requests and DNS-validates the ACM certificate
+           automatically (no manual certificate steps required).
+        2. An ALIAS record for weather.craftingnewtech.com is created.
+      Leave blank only if the domain is managed outside Route 53 — in that
+      case supply AcmCertificateArn and create the DNS records manually.
+
+# ── Conditions ────────────────────────────────────────────────────────────────
+Conditions:
+  # True when HostedZoneId is provided — enables auto cert creation and DNS record
+  CreateDnsRecord: !Not [!Equals [!Ref HostedZoneId, '']]
+  # Alias for readability — same gate used for both cert and DNS record
+  AutoValidateCert: !Not [!Equals [!Ref HostedZoneId, '']]
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── ACM Certificate (auto-created when domain is in Route 53) ────────────
+  # When HostedZoneId is provided, CloudFormation requests the certificate and
+  # automatically adds the DNS validation CNAME to the Route 53 hosted zone.
+  # CloudFormation then waits (up to 2 hours, typically < 5 minutes) for ACM
+  # to validate and issue the certificate before continuing the stack.
+  #
+  # CloudFormation limitation: this only works when the domain is in Route 53.
+  # If HostedZoneId is omitted (domain at another registrar), set AcmCertificateArn
+  # to a pre-validated certificate ARN and skip this resource.
+  SiteCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: AutoValidateCert
+    Properties:
+      DomainName: !Ref AlternateDomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref AlternateDomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── CloudFront Function — Directory Index Rewriting ───────────────────────
+  # OAC (REST API access) does not support S3 directory index documents.
+  # This function rewrites paths ending in / or with no file extension to
+  # append /index.html, enabling /architecture/ → /architecture/index.html.
+  # CloudFront Functions run at edge with <1 ms overhead and have no extra cost
+  # within the 2 million free tier requests/month.
+  DirectoryIndexFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${ProjectName}-directory-index-${Environment}'
+      AutoPublish: true
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          // Append index.html to directory paths (trailing slash)
+          if (uri.endsWith('/')) {
+            request.uri += 'index.html';
+          }
+          // Append /index.html to paths with no file extension
+          else if (!uri.split('/').pop().includes('.')) {
+            request.uri += '/index.html';
+          }
+          return request;
+        }
+      FunctionConfig:
+        Comment: 'Rewrites directory paths to serve index.html from S3 via OAC'
+        Runtime: cloudfront-js-1.0
+
+  # ── CloudFront Response Headers Policy ────────────────────────────────────
+  # Adds HTTP security headers to all CloudFront responses. Defence-in-depth:
+  # the Lambda also sets these headers for API responses, but CDN-level headers
+  # protect the static HTML/CSS/JS too.
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${ProjectName}-security-headers-${Environment}'
+        Comment: 'OWASP-recommended security headers for the weather dashboard'
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            Override: false
+            AccessControlMaxAgeSec: 63072000
+            IncludeSubdomains: true
+            Preload: false
+          ContentTypeOptions:
+            Override: false
+          FrameOptions:
+            FrameOption: DENY
+            Override: false
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: false
+          XSSProtection:
+            ModeBlock: true
+            Override: false
+            Protection: true
+
+  # ── Origin Access Control ──────────────────────────────────────────────────
+  # OAC replaces the older OAI (Origin Access Identity) — it uses IAM Sigv4
+  # signing and supports SSE-KMS buckets. CloudFront signs every request to
+  # S3 so the bucket can remain fully private (BlockPublicAccess: true).
+  WebsiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac-${Environment}'
+        Description: 'OAC for CloudFront → S3 website bucket (sigv4)'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ── CloudFront Distribution ────────────────────────────────────────────────
+  # Serves the weather dashboard frontend globally from the S3 website bucket.
+  # HTTPS-only; HTTP is permanently redirected. Alternate domain and ACM cert
+  # allow users to reach the site at weather.craftingnewtech.com.
+  WeatherDashboardDistribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_68
+            comment: "WAF costs ~$5/month base — not justified for portfolio traffic. Lambda ReservedConcurrentExecutions: 10 bounds blast radius instead"
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'Weather Dashboard (${Environment}) — weather.craftingnewtech.com'
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        # Use the custom domain and ACM cert
+        Aliases:
+          - !Ref AlternateDomainName
+        ViewerCertificate:
+          # Use the auto-created cert when HostedZoneId is provided;
+          # fall back to the caller-supplied ARN for non-Route 53 domains.
+          AcmCertificateArn: !If
+            - AutoValidateCert
+            - !Ref SiteCertificate
+            - !Ref AcmCertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: S3WebsiteOrigin
+            DomainName: !Ref WebsiteBucketDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt WebsiteOriginAccessControl.Id
+        DefaultCacheBehavior:
+          TargetOriginId: S3WebsiteOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed CachingOptimized policy — caches based on Accept-Encoding
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          # No origin request headers forwarded — S3 doesn't use them
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt DirectoryIndexFunction.FunctionARN
+        # S3 returns 403 for missing keys (private bucket) — remap to 404
+        # so browsers and CDN clients receive a proper not-found response
+        # rather than a confusing 403.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+        Logging:
+          Bucket: !Sub '${WebsiteBucketName}.s3.amazonaws.com'
+          Prefix: 'cloudfront-logs/'
+          IncludeCookies: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── S3 Bucket Policy — OAC Access ─────────────────────────────────────────
+  # Grants CloudFront's OAC principal s3:GetObject on the website bucket.
+  # Placed here (not in 02-storage.yml) because it requires the CloudFront
+  # distribution ARN. Also denies all insecure (non-HTTPS) access.
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${WebsiteBucketName}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub >-
+                  arn:aws:cloudfront::${AWS::AccountId}:distribution/${WeatherDashboardDistribution}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${WebsiteBucketName}'
+              - !Sub 'arn:aws:s3:::${WebsiteBucketName}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ── Route 53 ALIAS Record (optional) ──────────────────────────────────────
+  # Creates weather.craftingnewtech.com → CloudFront distribution ALIAS.
+  # Enabled only when HostedZoneId is provided. Z2FDTNDATAQYW2 is the fixed
+  # hosted zone ID for all CloudFront distributions (AWS-owned, not account-specific).
+  WeatherDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateDnsRecord
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref AlternateDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt WeatherDashboardDistribution.DomainName
+        EvaluateTargetHealth: false
+        HostedZoneId: Z2FDTNDATAQYW2
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  DistributionId:
+    Description: >
+      CloudFront distribution ID — used by the buildspec to run
+      `cloudfront create-invalidation` after each frontend deploy,
+      and by 08-pipeline.yml for CodeBuild environment variable injection.
+    Value: !Ref WeatherDashboardDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionId'
+
+  DistributionDomainName:
+    Description: >
+      CloudFront-assigned domain (e.g. d1abc.cloudfront.net). Use this as
+      a smoke-test URL before the Route 53 DNS record propagates.
+    Value: !GetAtt WeatherDashboardDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionDomainName'
+
+  WebsiteUrl:
+    Description: Custom domain URL for the weather dashboard.
+    Value: !Sub 'https://${AlternateDomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebsiteUrl'

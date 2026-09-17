@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — Bootstrap Stack.
+  Creates the artifacts bucket (pipeline artifacts, Lambda ZIPs, packaged CFN
+  templates) BEFORE the master stack is deployed. This solves the chicken-and-egg
+  dependency: the Lambda deployment ZIP must exist in S3 before CloudFormation can
+  create the Lambda function in the same deploy run.
+
+  Deploy this stack once per AWS account before running the master stack.
+  DeletionPolicy: Retain on all resources — this stack is intentionally permanent
+  and must NOT be deleted as part of normal application teardown or re-deployment.
+
+  Existing accounts: use CloudFormation resource import to adopt a pre-existing
+  bucket into this stack (see docs/deployment-guide.md Step 4).
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier used in resource names and tags.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment.
+
+  BucketNameSuffix:
+    Type: String
+    Default: ''
+    Description: >
+      Appended to the artifacts bucket name. Required when bootstrapping a
+      second region (e.g. '-us-west-2') for multi-region failover
+      (docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md #2.1) -
+      S3 bucket names are globally unique, so the default (unchanged, no
+      suffix) bucket name from one region's bootstrap stack can't be reused
+      by another region's. Leave blank for the primary region - this must
+      never change for an already-deployed primary bootstrap stack, since
+      BucketName is a create-only property and changing it replaces the
+      bucket (breaking every pipeline/stack that references the old name).
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Artifacts Bucket ───────────────────────────────────────────────────────
+  # Pipeline artifact store, Lambda ZIPs, and cfn-packaged templates.
+  # Versioning is required by CodePipeline (stores pipeline artifacts by version).
+  # DeletionPolicy: Retain — this bucket is a bootstrap resource and must outlive
+  # any individual stack deployment or teardown cycle.
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Artifacts bucket does not need access logging — it is not externally accessible"
+    Properties:
+      BucketName: !Sub '${ProjectName}-artifacts-${AWS::AccountId}-${Environment}${BucketNameSuffix}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: pipeline-artifacts
+        - Key: ManagedBy
+          Value: cloudformation-bootstrap
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  ArtifactsBucketName:
+    Description: >
+      Artifacts bucket name — pass to master stack as ExistingArtifactsBucketName,
+      and use in Step 5 to upload the Lambda ZIP before running cfn deploy.
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucketName'
+
+  ArtifactsBucketArn:
+    Description: Artifacts bucket ARN — for reference in IAM policy scoping.
+    Value: !GetAtt ArtifactsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucketArn'

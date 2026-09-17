@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Weather App — Real-time weather powered by AWS serverless architecture." />
+
+  <!-- Content Security Policy: restricts scripts, styles, images, and API connections -->
+  <meta http-equiv="Content-Security-Policy"
+    content="
+      default-src 'self';
+      script-src  'self';
+      style-src   'self' https://fonts.googleapis.com;
+      font-src    'self' https://fonts.gstatic.com;
+      img-src     'self' https://openweathermap.org data:;
+      connect-src 'self' https://api.weather.craftingnewtech.com;
+    " />
+
+  <title>Weather App</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+
+  <!-- ── Navigation ──────────────────────────────────────────────────────── -->
+  <header class="nav" role="banner">
+    <a href="/" class="nav__brand" aria-label="Weather App home">
+      <svg class="nav__logo" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M3 17h1m16 0h1M12 3v1m-7.07 2.93-.71-.71M19.07 6.93l.71-.71M5 17a7 7 0 0 1 14 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        <path d="M5 17h14a3 3 0 1 1-3-3H8a3 3 0 1 1-3 3Z" fill="currentColor" opacity=".2"/>
+      </svg>
+      <span class="nav__title">Weather App</span>
+    </a>
+    <nav aria-label="Main navigation">
+      <ul class="nav__links" role="list">
+        <li><a href="/" class="nav__link nav__link--active" aria-current="page">Home</a></li>
+        <li><a href="/about/" class="nav__link">About</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <!-- ── Main content ─────────────────────────────────────────────────────── -->
+  <main class="main" id="main-content">
+
+    <!-- Search bar -->
+    <section class="search-section" aria-label="City search">
+      <form class="search-form" id="search-form" role="search" novalidate>
+        <label for="city-input" class="sr-only">Enter city name</label>
+        <div class="search-input-wrap">
+          <button
+            type="button"
+            class="locate-btn"
+            id="locate-btn"
+            aria-label="Use my current location"
+            title="Use my current location"
+          >
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+              <circle cx="12" cy="9" r="2.5" stroke="currentColor" stroke-width="2"/>
+            </svg>
+          </button>
+          <input
+            type="text"
+            id="city-input"
+            class="search-input"
+            placeholder="Search for a city..."
+            autocomplete="off"
+            autocorrect="off"
+            spellcheck="false"
+            maxlength="100"
+            aria-required="true"
+            aria-describedby="search-hint"
+          />
+        </div>
+        <button type="submit" class="btn btn--primary" id="search-btn">
+          Get Weather
+        </button>
+      </form>
+      <p id="search-hint" class="search-attribution">
+        Powered by <a href="https://openweathermap.org" target="_blank" rel="noopener noreferrer">OpenWeatherMap</a>
+      </p>
+    </section>
+
+    <!-- Loading state -->
+    <div class="loading" id="loading" aria-live="polite" aria-label="Loading weather data" hidden>
+      <div class="loading__spinner" aria-hidden="true"></div>
+      <span>Fetching weather data…</span>
+    </div>
+
+    <!-- Error state -->
+    <div class="error-card" id="error-card" role="alert" aria-live="assertive" hidden>
+      <svg class="error-card__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
+        <path d="M12 8v4m0 4h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <p class="error-card__message" id="error-message"></p>
+    </div>
+
+    <!-- ── Current weather card ──────────────────────────────────────────── -->
+    <section class="weather-card" id="weather-card" aria-label="Current weather" hidden>
+
+      <div class="weather-card__header">
+        <div>
+          <h1 class="weather-card__city" id="city-name">—</h1>
+          <p class="weather-card__date" id="weather-date">—</p>
+        </div>
+      </div>
+
+      <div class="weather-card__body">
+
+        <!-- Left — icon | temp + description -->
+        <div class="weather-card__main">
+          <img
+            class="weather-card__icon"
+            id="weather-icon"
+            src=""
+            alt=""
+            width="112"
+            height="112"
+          />
+          <div class="weather-card__main-info">
+            <div class="weather-card__temp-wrap">
+              <span class="weather-card__temp" id="current-temp">—</span>
+              <span class="weather-card__unit">°<span id="current-unit">F</span></span>
+            </div>
+            <p class="weather-card__desc" id="weather-desc">—</p>
+          </div>
+        </div>
+
+        <!-- Right — stats grid -->
+        <div class="weather-card__stats" role="list" aria-label="Weather details">
+
+          <div class="stat" role="listitem">
+            <svg class="stat__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 3c2 4 5 6 5 10a5 5 0 0 1-10 0c0-4 3-6 5-10Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+            </svg>
+            <span class="stat__label">Feels Like</span>
+            <span class="stat__value" id="feels-like">—</span>
+          </div>
+
+          <div class="stat" role="listitem">
+            <svg class="stat__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 2v2M5.22 5.22l1.42 1.42M2 12h2m15.56-6.78 1.42-1.42M22 12h-2m-2.64 6.36 1.42 1.42M12 22v-2M5.22 18.78l1.42-1.42" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <circle cx="12" cy="12" r="4" stroke="currentColor" stroke-width="2"/>
+            </svg>
+            <span class="stat__label">Humidity</span>
+            <span class="stat__value" id="humidity">—</span>
+          </div>
+
+          <div class="stat" role="listitem">
+            <svg class="stat__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M9.59 4.59A2 2 0 1 1 11 8H2m10.59 11.41A2 2 0 1 0 14 16H2m15.73-8.27A2.5 2.5 0 1 1 19.5 12H2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+            <span class="stat__label">Wind</span>
+            <span class="stat__value" id="wind-speed">—</span>
+          </div>
+
+          <div class="stat" role="listitem">
+            <svg class="stat__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
+              <path d="M12 8v4l3 3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+            <span class="stat__label">Pressure</span>
+            <span class="stat__value" id="pressure">—</span>
+          </div>
+
+          <div class="stat" role="listitem">
+            <svg class="stat__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" stroke="currentColor" stroke-width="2"/>
+              <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2"/>
+            </svg>
+            <span class="stat__label">Visibility</span>
+            <span class="stat__value" id="visibility">—</span>
+          </div>
+
+          <div class="stat" role="listitem">
+            <svg class="stat__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M20 17.58A5 5 0 0 0 18 8h-1.26A8 8 0 1 0 4 16.25" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <path d="M8 19v2M12 17v2M16 19v2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+            <span class="stat__label">Precipitation</span>
+            <span class="stat__value" id="precipitation">—</span>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 7-Day Forecast ────────────────────────────────────────────────── -->
+    <section class="forecast-section" id="forecast-section" aria-label="7-day forecast" hidden>
+
+      <div class="forecast-header">
+        <h2 class="forecast-title" id="forecast-title">5-Day Forecast</h2>
+        <div class="unit-toggle" role="group" aria-label="Temperature unit">
+          <button class="unit-btn"                  id="btn-celsius"    aria-pressed="false" data-unit="C">°C</button>
+          <button class="unit-btn unit-btn--active" id="btn-fahrenheit" aria-pressed="true"  data-unit="F">°F</button>
+        </div>
+      </div>
+
+      <div class="forecast-grid" id="forecast-grid" aria-label="Daily forecasts">
+        <!-- Forecast cards injected by app.js -->
+      </div>
+
+      <!-- Hourly strip — shown below the grid when a day card is expanded -->
+      <div class="hourly-strip" id="hourly-strip" hidden>
+        <!-- Populated by app.js renderHourly() -->
+      </div>
+
+    </section>
+
+    <!-- ── Air Quality (collapsible — EPA 0-500 gauge) ─────────────────────── -->
+    <section class="forecast-section" id="aqi-section" aria-label="Air quality" hidden>
+
+      <button
+        type="button"
+        class="forecast-header aqi-toggle"
+        id="aqi-toggle"
+        aria-expanded="false"
+        aria-controls="aqi-body"
+      >
+        <div>
+          <h2 class="forecast-title">Air Quality</h2>
+          <p class="aqi-widget__location" id="aqi-location">—</p>
+        </div>
+        <div class="aqi-toggle__right">
+          <span class="aqi-badge" id="aqi-summary-badge">
+            <span class="aqi-badge__dot" aria-hidden="true"></span>
+            <span id="aqi-summary-label">—</span>
+          </span>
+          <span class="forecast-card__chevron" aria-hidden="true"></span>
+        </div>
+      </button>
+
+      <div class="aqi-body" id="aqi-body" hidden>
+
+        <div class="aqi-widget">
+          <div id="aqi-gauge-mount" aria-hidden="true">
+            <!-- SVG gauge injected by app.js via aqi_gauge.js -->
+            <!-- (document.createElementNS + appendChild — never innerHTML) -->
+          </div>
+
+          <div class="aqi-widget__meta">
+            <p class="aqi-widget__pollutant" id="aqi-pollutant">—</p>
+            <p class="aqi-widget__timestamp" id="aqi-timestamp">—</p>
+          </div>
+        </div>
+
+        <div class="aqi-legend" role="list" aria-label="AQI category legend">
+          <div class="aqi-legend__item" role="listitem"><span class="aqi-legend__dot aqi-legend__dot--good" aria-hidden="true"></span>Good</div>
+          <div class="aqi-legend__item" role="listitem"><span class="aqi-legend__dot aqi-legend__dot--moderate" aria-hidden="true"></span>Moderate</div>
+          <div class="aqi-legend__item" role="listitem"><span class="aqi-legend__dot aqi-legend__dot--usg" aria-hidden="true"></span>Unhealthy for Sensitive Groups</div>
+          <div class="aqi-legend__item" role="listitem"><span class="aqi-legend__dot aqi-legend__dot--unhealthy" aria-hidden="true"></span>Unhealthy</div>
+          <div class="aqi-legend__item" role="listitem"><span class="aqi-legend__dot aqi-legend__dot--very-unhealthy" aria-hidden="true"></span>Very Unhealthy</div>
+          <div class="aqi-legend__item" role="listitem"><span class="aqi-legend__dot aqi-legend__dot--hazardous" aria-hidden="true"></span>Hazardous</div>
+        </div>
+
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ── Footer ───────────────────────────────────────────────────────────── -->
+  <footer class="site-footer" role="contentinfo">
+    <div class="footer-cards">
+
+      <div class="footer-card">
+        <!-- Shield with checkmark -->
+        <svg class="footer-card__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M12 2L4 6v5c0 5.25 3.5 9.74 8 11 4.5-1.26 8-5.75 8-11V6L12 2Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+          <path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <h3 class="footer-card__title">Secure &amp; Private</h3>
+        <p class="footer-card__text">No user accounts. No data stored. We only call the weather API.</p>
+      </div>
+
+      <div class="footer-card">
+        <!-- Dollar sign in circle -->
+        <svg class="footer-card__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
+          <path d="M12 6v12M15 9.5H10.5a2.5 2.5 0 0 0 0 5h3a2.5 2.5 0 0 1 0 5H9" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <h3 class="footer-card__title">Cost Efficient</h3>
+        <p class="footer-card__text">Uses free-tier services and caching to reduce API calls and cost.</p>
+      </div>
+
+      <div class="footer-card">
+        <!-- Padlock -->
+        <svg class="footer-card__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <rect x="5" y="11" width="14" height="10" rx="2" stroke="currentColor" stroke-width="2"/>
+          <path d="M8 11V7a4 4 0 1 1 8 0v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <h3 class="footer-card__title">Built with Best Practices</h3>
+        <p class="footer-card__text">Least privilege IAM, HTTPS encryption, and secure defaults.</p>
+      </div>
+
+    </div>
+
+    <p class="footer-copy">© 2026 Weather App. All rights reserved.</p>
+  </footer>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

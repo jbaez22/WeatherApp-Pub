@@ -1,0 +1,98 @@
+version: 0.2
+
+# Stage: Deploy (App pipeline)
+# Builds/publishes the Lambda, shifts traffic via CodeDeploy canary, sets
+# Provisioned Concurrency, syncs the frontend + architecture diagram to S3,
+# invalidates CloudFront. Never touches a CloudFormation stack — that's the
+# Infra pipeline's job (deploy-infra.yml).
+#
+# Environment variables injected by the AppDeployProject CodeBuild project:
+#   ARTIFACTS_BUCKET           — S3 bucket for Lambda ZIPs
+#   WEBSITE_BUCKET             — S3 bucket for the static frontend
+#   LAMBDA_FUNCTION_NAME       — Lambda function updated on each deploy
+#   CLOUDFRONT_DISTRIBUTION_ID — CloudFront distribution invalidated after sync
+#   ENVIRONMENT                — production | staging
+
+env:
+  variables:
+    PROVISIONED_CONCURRENCY: "1"
+
+phases:
+
+  install:
+    runtime-versions:
+      # python kept at 3.11 deliberately — this phase's pip install builds
+      # the actual Lambda deployment package, so it must match the Lambda
+      # function's deployed Runtime (still python3.11) or a compiled
+      # dependency wheel could be built for the wrong Python ABI. nodejs
+      # only builds the unrelated architecture-diagram frontend, so it's
+      # free to move independently — bumped to the current Active LTS.
+      python: "3.11"
+      nodejs: "24"
+    commands:
+      - pip install --quiet -r backend/lambda/requirements.txt
+      - cd diagrams/interactive && npm ci --silent && cd ../..
+
+  build:
+    commands:
+      - echo "=== Build and upload Lambda deployment package ==="
+      - |
+        rm -rf /tmp/lambda-pkg
+        mkdir -p /tmp/lambda-pkg
+        pip install -r backend/lambda/requirements.txt -t /tmp/lambda-pkg --quiet
+        cp backend/lambda/*.py /tmp/lambda-pkg/
+        cd /tmp/lambda-pkg && zip -r /tmp/lambda.zip . && cd "$CODEBUILD_SRC_DIR"
+        aws s3 cp /tmp/lambda.zip "s3://$ARTIFACTS_BUCKET/lambda/lambda.zip"
+        NEW_VERSION=$(aws lambda update-function-code \
+          --function-name "$LAMBDA_FUNCTION_NAME" \
+          --s3-bucket "$ARTIFACTS_BUCKET" \
+          --s3-key lambda/lambda.zip \
+          --publish --query 'Version' --output text)
+        echo "Published Lambda version: $NEW_VERSION"
+        aws lambda wait function-updated --function-name "$LAMBDA_FUNCTION_NAME"
+
+      - echo "=== Shift traffic to the new version via CodeDeploy ==="
+      - TARGET_VERSION="$NEW_VERSION" bash scripts/deploy-canary.sh
+
+      - echo "=== Set Provisioned Concurrency on the 'live' alias ==="
+      - |
+        aws lambda put-provisioned-concurrency-config \
+          --function-name "$LAMBDA_FUNCTION_NAME" \
+          --qualifier live \
+          --provisioned-concurrent-executions "$PROVISIONED_CONCURRENCY"
+
+      - echo "=== Sync frontend to S3 ==="
+      - |
+        aws s3 sync frontend/ "s3://$WEBSITE_BUCKET/" \
+          --delete \
+          --exclude "*.html" \
+          --cache-control "max-age=86400, public"
+      - |
+        aws s3 sync frontend/ "s3://$WEBSITE_BUCKET/" \
+          --exclude "*" --include "*.html" \
+          --cache-control "no-cache, no-store, must-revalidate"
+
+      - echo "=== Build and sync architecture diagram app ==="
+      - cd diagrams/interactive && npm run build && cd ../..
+      - |
+        aws s3 sync dist-architecture/ "s3://$WEBSITE_BUCKET/architecture/" \
+          --delete \
+          --exclude "*.html" \
+          --cache-control "max-age=86400, public"
+      - |
+        aws s3 sync dist-architecture/ "s3://$WEBSITE_BUCKET/architecture/" \
+          --exclude "*" --include "*.html" \
+          --cache-control "no-cache, no-store, must-revalidate"
+
+  post_build:
+    commands:
+      - echo "=== Invalidate CloudFront cache ==="
+      - bash pipeline/scripts/invalidate-cloudfront.sh
+
+      - |
+        echo "=== App deployment summary ==="
+        echo "  Environment  = $ENVIRONMENT"
+        echo "  Lambda       = $LAMBDA_FUNCTION_NAME"
+        echo "  Website      = https://weather.craftingnewtech.com"
+        echo "  Architecture = https://weather.craftingnewtech.com/architecture/"
+        echo "Build $CODEBUILD_BUILD_NUMBER complete."

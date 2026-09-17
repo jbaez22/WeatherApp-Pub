@@ -1,0 +1,53 @@
+version: 0.2
+
+# Stage: ValidateDeployment (Infra pipeline) — runs AFTER Deploy.
+# Confirms the CFN update landed cleanly: no drift, and the outputs the App
+# pipeline depends on (ApiEndpoint, WebsiteUrl) still resolve. No HTTP call
+# against the live API — that's the App pipeline's SmokeTest job, since only
+# App deploys touch the surface that check exercises.
+#
+# Environment variables injected by the InfraValidateDeploymentProject
+# CodeBuild project:
+#   STACK_NAME — master stack name, e.g. weather-dashboard-master-production
+
+phases:
+
+  build:
+    on-failure: ABORT
+    commands:
+      - echo "=== Detect stack drift on $STACK_NAME ==="
+      - |
+        DRIFT_ID=$(aws cloudformation detect-stack-drift \
+          --stack-name "$STACK_NAME" \
+          --query 'StackDriftDetectionId' --output text)
+        for i in $(seq 1 24); do
+          STATUS=$(aws cloudformation describe-stack-drift-detection-status \
+            --stack-drift-detection-id "$DRIFT_ID" \
+            --query 'DetectionStatus' --output text)
+          [ "$STATUS" = "DETECTION_IN_PROGRESS" ] || break
+          sleep 5
+        done
+        DRIFT_RESULT=$(aws cloudformation describe-stack-drift-detection-status \
+          --stack-drift-detection-id "$DRIFT_ID" \
+          --query 'StackDriftStatus' --output text)
+        echo "Drift status: $DRIFT_RESULT"
+        if [ "$DRIFT_RESULT" != "IN_SYNC" ]; then
+          echo "Stack has drifted from its template."
+          echo "Investigate with: aws cloudformation describe-stack-resource-drifts --stack-name $STACK_NAME"
+          exit 1
+        fi
+
+      - echo "=== Confirm key stack outputs still resolve ==="
+      - |
+        aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+          --query 'Stacks[0].Outputs' > /tmp/outputs.json
+        python3 -c "
+        import json
+        with open('/tmp/outputs.json') as f:
+            outputs = {o['OutputKey']: o['OutputValue'] for o in json.load(f)}
+        required = ['WebsiteUrl', 'ApiEndpoint', 'WeatherEndpoint']
+        missing = [k for k in required if not outputs.get(k)]
+        assert not missing, f'Missing/empty required outputs: {missing}'
+        print('OK — all required outputs present:', required)
+        "
+      - echo "Infra post-deploy validation passed."

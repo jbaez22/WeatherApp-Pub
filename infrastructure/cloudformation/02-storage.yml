@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — S3 Storage Layer.
+  Two buckets: WebsiteBucket (serves static frontend via CloudFront OAC,
+  no public access) and the artifacts bucket (pipeline artifacts, Lambda ZIPs,
+  CFN packaged templates). The artifacts bucket is pre-created during bootstrap
+  and passed in as ExistingArtifactsBucketName — this stack attaches a TLS
+  enforcement bucket policy to it and exports its name/ARN for downstream stacks.
+  CloudFront's OAC bucket policy is added in 03-cdn.yml after the distribution
+  ARN is known.
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier used in resource names and tags.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment.
+
+  ExistingArtifactsBucketName:
+    Type: String
+    Description: >
+      Name of the pre-created artifacts bucket (created during bootstrap before
+      this stack is deployed so the Lambda ZIP can be uploaded first).
+      Must already exist in the same account and region.
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Website Bucket ─────────────────────────────────────────────────────────
+  # Serves HTML/CSS/JS for the weather dashboard frontend. All public access
+  # is blocked — only CloudFront's OAC IAM principal can read objects.
+  # The bucket policy granting OAC access is in 03-cdn.yml (needs the
+  # CloudFront distribution ARN which is not known at this stack's deploy time).
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "CloudFront access logs are already written to this bucket (03-cdn.yml Logging config) — S3 server access logging is redundant"
+          - id: CKV_AWS_21
+            comment: "Website content is pipeline-managed; CodeCommit provides version history. S3 versioning adds cost without benefit for a deploy-only bucket"
+    Properties:
+      BucketName: !Sub '${ProjectName}-website-${AWS::AccountId}-${Environment}'
+      # No static website hosting — OAC requires the REST API endpoint, not
+      # the website endpoint. CloudFront handles default document logic via
+      # a CloudFront Function defined in 03-cdn.yml.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Re-enable ACLs so CloudFront can deliver access logs to this bucket.
+      # BucketOwnerEnforced (new S3 default since 2023) disables ACLs entirely,
+      # causing CloudFront to reject the distribution with "ACL access not enabled".
+      # ObjectWriter allows CloudFront's canonical user ID to set private ACLs
+      # while BlockPublicAcls still prevents any public ACL grants.
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Suspended
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: static-website
+
+  # ── Artifacts Bucket Policy ────────────────────────────────────────────────
+  # Enforces TLS for all in-transit access to the artifacts bucket.
+  # The bucket itself is pre-created during bootstrap (see deployment-guide.md);
+  # this policy is applied to it here so the security control is tracked in CFN.
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ExistingArtifactsBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${ExistingArtifactsBucketName}'
+              - !Sub 'arn:aws:s3:::${ExistingArtifactsBucketName}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  WebsiteBucketName:
+    Description: >
+      Website bucket name — passed to 03-cdn.yml (OAC origin), 08-pipeline.yml
+      (CodeBuild sync), and 01-iam.yml (CodeBuild role resource scope).
+    Value: !Ref WebsiteBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-WebsiteBucketName'
+
+  WebsiteBucketArn:
+    Description: Website bucket ARN — used to scope IAM policies in 01-iam.yml.
+    Value: !GetAtt WebsiteBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebsiteBucketArn'
+
+  WebsiteBucketDomainName:
+    Description: >
+      S3 REST API domain name for the website bucket — used as the CloudFront
+      origin domain in 03-cdn.yml. Must use the REST endpoint (not the website
+      endpoint) because OAC requires the REST interface.
+    Value: !GetAtt WebsiteBucket.RegionalDomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-WebsiteBucketDomainName'
+
+  ArtifactsBucketName:
+    Description: >
+      Artifacts bucket name — passed to 01-iam.yml (IAM scope), 05-backend.yml
+      (Lambda code S3 key), 08-pipeline.yml (pipeline artifact store), and
+      CodeBuild buildspec environment variables.
+    Value: !Ref ExistingArtifactsBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucketName'
+
+  ArtifactsBucketArn:
+    Description: Artifacts bucket ARN — used to scope IAM policies in 01-iam.yml.
+    Value: !Sub 'arn:aws:s3:::${ExistingArtifactsBucketName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucketArn'

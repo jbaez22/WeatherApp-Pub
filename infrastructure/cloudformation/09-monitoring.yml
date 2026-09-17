@@ -1,0 +1,376 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — CloudWatch Monitoring (Dashboard + Alarms + SNS).
+  Dashboard provides a single-pane view of Lambda invocations, errors,
+  duration, API Gateway request counts, and error rates. Four alarms cover
+  the most operationally significant failure modes: Lambda errors, Lambda
+  near-timeout, API 5xx errors, and API 4xx spike (possible abuse).
+  An SNS topic is created for alarm notifications; subscribe your email
+  after bootstrap with: aws sns subscribe --topic-arn <TopicArn> \
+    --protocol email --notification-endpoint you@example.com
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier used in resource names and tags.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment.
+
+  LambdaFunctionName:
+    Type: String
+    Description: >
+      Lambda function name (from 05-backend stack output LambdaFunctionName).
+      Used as the CloudWatch Metrics Lambda dimension value.
+
+  ApiId:
+    Type: String
+    Description: >
+      API Gateway HTTP API ID (from 06-api stack output ApiId).
+      Used as the CloudWatch Metrics ApiId dimension value.
+
+  LambdaDurationThresholdMs:
+    Type: Number
+    Default: 24000
+    Description: >
+      Lambda duration threshold in milliseconds that triggers the near-timeout
+      alarm. Default 24000 = 80% of the 30-second Lambda timeout. Adjust if
+      TimeoutSeconds changes in 05-backend.yml (threshold = timeout_s * 800).
+
+  LambdaErrorThreshold:
+    Type: Number
+    Default: 5
+    Description: >
+      Number of Lambda errors in a 5-minute window that triggers the alarm.
+      Set to 1 for zero-tolerance environments; 5 allows for transient errors.
+
+  Api5xxThreshold:
+    Type: Number
+    Default: 3
+    Description: Number of API Gateway 5xx responses per 5 minutes before alarm.
+
+  Api4xxThreshold:
+    Type: Number
+    Default: 50
+    Description: >
+      Number of API Gateway 4xx responses per 5 minutes before alarm.
+      High 4xx counts may indicate scraping, abuse, or a frontend bug.
+
+  PrimaryHealthCheckId:
+    Type: String
+    Default: ''
+    Description: >
+      Route 53 health check ID from the standalone
+      weather-dashboard-failover-dns-production stack (multi-region plan
+      §3.1/§4.4). Leave blank until that stack exists.
+
+# ── Conditions ───────────────────────────────────────────────────────────────
+Conditions:
+  HasPrimaryHealthCheck: !Not [!Equals [!Ref PrimaryHealthCheckId, '']]
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── SNS Topic for Alarm Notifications ────────────────────────────────────
+  # Subscribe your email after bootstrap:
+  #   aws sns subscribe --topic-arn <AlarmTopicArn> \
+  #     --protocol email --notification-endpoint your@email.com
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_26
+            comment: "SNS topic delivers CloudWatch alarm notifications (email only) — no PII or secrets in messages; KMS adds cost without security benefit"
+    Properties:
+      TopicName: !Sub '${ProjectName}-alarms-${Environment}'
+      DisplayName: !Sub 'Weather Dashboard Alarms (${Environment})'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda Error Alarm ────────────────────────────────────────────────────
+  # Fires when Lambda throws more errors than LambdaErrorThreshold in a
+  # 5-minute window. Any Lambda error surfaces as a 502 to the user, so
+  # even a handful is operationally significant.
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: !Sub >-
+        Lambda function ${LambdaFunctionName} exceeded ${LambdaErrorThreshold}
+        errors in a 5-minute window. Users are receiving 502 responses.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref LambdaErrorThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # ── Lambda Near-Timeout Alarm ─────────────────────────────────────────────
+  # Fires when average Lambda duration exceeds 80% of the configured timeout.
+  # A function running at 80% timeout is approaching failure risk — root cause
+  # is usually a slow OWM API response or DynamoDB cold start.
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-near-timeout-${Environment}'
+      AlarmDescription: !Sub >-
+        Lambda function ${LambdaFunctionName} average duration exceeded the
+        ${LambdaDurationThresholdMs}ms threshold. Investigate OWM API latency.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaDurationThresholdMs
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # ── API Gateway 5xx Alarm ─────────────────────────────────────────────────
+  # API 5xx = Lambda error or integration timeout surfaced to the user.
+  # Low threshold because server errors should be rare for a read-only API.
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-5xx-${Environment}'
+      AlarmDescription: !Sub >-
+        API Gateway ${ApiId} exceeded ${Api5xxThreshold} 5xx errors in 5 minutes.
+        Users are receiving server error responses.
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref ApiId
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref Api5xxThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # ── API Gateway 4xx Alarm ─────────────────────────────────────────────────
+  # 4xx errors are expected (validation failures, city not found) but a spike
+  # above the threshold suggests abuse, a broken frontend, or an API change.
+  Api4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-4xx-spike-${Environment}'
+      AlarmDescription: !Sub >-
+        API Gateway ${ApiId} exceeded ${Api4xxThreshold} 4xx errors in 5 minutes.
+        May indicate a frontend bug, API contract change, or request scraping.
+      Namespace: AWS/ApiGateway
+      MetricName: 4XXError
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref ApiId
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref Api4xxThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # ── Route 53 Failover Active Alarm ────────────────────────────────────────
+  # HealthCheckStatus of 0 means Route 53 considers the primary region
+  # unhealthy and is actively serving the secondary region's failover
+  # record (multi-region plan §4.4). Route 53 health check metrics are only
+  # published to CloudWatch in us-east-1, regardless of which region the
+  # check itself targets - this alarm must be deployed there.
+  Route53HealthCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasPrimaryHealthCheck
+    Properties:
+      AlarmName: !Sub '${ProjectName}-route53-failover-active-${Environment}'
+      AlarmDescription: >-
+        Route 53 has failed over to us-west-2 - the primary region's health
+        check has failed 3 consecutive times. See the multi-region runbook.
+      Namespace: AWS/Route53
+      MetricName: HealthCheckStatus
+      Dimensions:
+        - Name: HealthCheckId
+          Value: !Ref PrimaryHealthCheckId
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # ── CloudWatch Dashboard ───────────────────────────────────────────────────
+  # Single-pane view for on-call reference. Shows the four most important
+  # signals: Lambda invocations/errors, Lambda duration, API Gateway request
+  # volume, and API Gateway error rates. Timeframe: last 3 hours by default.
+  WeatherDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda — Invocations & Errors",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${LambdaFunctionName}", {"color": "#2563eb", "label": "Invocations"}],
+                  ["AWS/Lambda", "Errors",      "FunctionName", "${LambdaFunctionName}", {"color": "#dc2626", "label": "Errors"}],
+                  ["AWS/Lambda", "Throttles",   "FunctionName", "${LambdaFunctionName}", {"color": "#d97706", "label": "Throttles"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda — Duration (ms)",
+                "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${LambdaFunctionName}", {"stat": "Average", "label": "Avg", "color": "#2563eb"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${LambdaFunctionName}", {"stat": "Maximum", "label": "Max", "color": "#dc2626"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${LambdaFunctionName}", {"stat": "p95",     "label": "p95", "color": "#d97706"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}",
+                "yAxis": {"left": {"min": 0}},
+                "annotations": {"horizontal": [{"label": "80% timeout (24 s)", "value": 24000, "color": "#dc2626"}]}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "API Gateway — Request Count",
+                "view": "timeSeries",
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiId", "${ApiId}", {"color": "#2563eb", "label": "Requests"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "API Gateway — Error Rates",
+                "view": "timeSeries",
+                "metrics": [
+                  ["AWS/ApiGateway", "4XXError", "ApiId", "${ApiId}", {"color": "#d97706", "label": "4xx"}],
+                  ["AWS/ApiGateway", "5XXError", "ApiId", "${ApiId}", {"color": "#dc2626", "label": "5xx"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "SLO — Error Rate (target < 0.1%)",
+                "view": "timeSeries",
+                "metrics": [
+                  [{"expression": "100*(m1+m2)/m3", "label": "Error Rate %", "id": "e1", "color": "#dc2626"}],
+                  ["AWS/ApiGateway", "5XXError", "ApiId", "${ApiId}", {"id": "m1", "visible": false, "stat": "Sum"}],
+                  ["AWS/ApiGateway", "4XXError", "ApiId", "${ApiId}", {"id": "m2", "visible": false, "stat": "Sum"}],
+                  ["AWS/ApiGateway", "Count",    "ApiId", "${ApiId}", {"id": "m3", "visible": false, "stat": "Sum"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}",
+                "annotations": {"horizontal": [{"label": "0.1% SLO", "value": 0.1, "color": "#991b1b"}]}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "SLO — API Latency p99 (target < 1000ms)",
+                "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${LambdaFunctionName}", {"stat": "p99", "color": "#2563eb"}]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}",
+                "annotations": {"horizontal": [{"label": "1000ms SLO", "value": 1000, "color": "#991b1b"}]}
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 0, "y": 18, "width": 24, "height": 2,
+              "properties": {
+                "title": "Active Alarms",
+                "alarms": [
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-lambda-errors-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-lambda-near-timeout-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-api-5xx-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-api-4xx-spike-${Environment}"
+                ]
+              }
+            }
+          ]
+        }
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  DashboardName:
+    Description: CloudWatch dashboard name — navigate to it in the AWS console.
+    Value: !Ref WeatherDashboard
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardName'
+
+  AlarmTopicArn:
+    Description: >
+      SNS alarm topic ARN. Subscribe your email to receive alarm notifications:
+        aws sns subscribe --topic-arn <this ARN> \
+          --protocol email --notification-endpoint you@example.com
+    Value: !Ref AlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmTopicArn'

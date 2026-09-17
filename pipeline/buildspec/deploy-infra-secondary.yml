@@ -1,0 +1,64 @@
+version: 0.2
+
+# Stage: DeploySecondary (Infra pipeline)
+# Packages and deploys master-secondary.yml (BackendStack + ApiStack only) to
+# the multi-region failover region. Runs in this pipeline's own region like
+# every other stage — every AWS CLI call below targets --region us-west-2
+# explicitly, the same pattern proven working manually for tasks 2.1/2.3/2.5.
+# No CodePipeline cross-region ArtifactStores/Region-property machinery is
+# used or needed (see infrastructure/cloudformation/08-pipeline.yml's
+# DeploySecondaryProject comment).
+#
+# Environment variables injected by the DeploySecondaryProject CodeBuild project:
+#   SECONDARY_ARTIFACTS_BUCKET — us-west-2 artifacts bucket (Lambda ZIPs must
+#                                be in the same region as the function)
+#   CFN_DEPLOY_ROLE_ARN        — IAM role CloudFormation assumes (global IAM
+#                                entity, works in any region — see plan §0.2 #9)
+#   ENVIRONMENT                — production | staging
+#   SECONDARY_REGION           — us-west-2
+#   SECONDARY_HOSTED_ZONE_ID   — Route 53 hosted zone for craftingnewtech.com
+
+env:
+  variables:
+    STACK_NAME: "weather-dashboard-secondary"
+
+phases:
+
+  build:
+    commands:
+      - echo "=== Package the secondary-region CloudFormation stack ==="
+      - |
+        aws cloudformation package \
+          --region "$SECONDARY_REGION" \
+          --template-file infrastructure/cloudformation/master-secondary.yml \
+          --s3-bucket "$SECONDARY_ARTIFACTS_BUCKET" \
+          --s3-prefix cloudformation \
+          --output-template-file infrastructure/cloudformation/master-secondary-packaged.yml
+
+      - echo "=== Deploy the secondary-region stack ==="
+      - |
+        aws cloudformation deploy \
+          --region "$SECONDARY_REGION" \
+          --template-file infrastructure/cloudformation/master-secondary-packaged.yml \
+          --stack-name "$STACK_NAME-$ENVIRONMENT" \
+          --role-arn "$CFN_DEPLOY_ROLE_ARN" \
+          --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+          --no-fail-on-empty-changeset \
+          --parameter-overrides \
+            ArtifactsBucketName="$SECONDARY_ARTIFACTS_BUCKET" \
+            LambdaZipKey=lambda/lambda.zip \
+            HostedZoneId="$SECONDARY_HOSTED_ZONE_ID"
+
+  post_build:
+    commands:
+      - |
+        echo "=== Secondary-region deployment summary ==="
+        echo "  Region      = $SECONDARY_REGION"
+        echo "  Environment = $ENVIRONMENT"
+        echo "  Stack       = $STACK_NAME-$ENVIRONMENT"
+        echo "Build $CODEBUILD_BUILD_NUMBER complete."
+
+artifacts:
+  files:
+    - infrastructure/cloudformation/master-secondary-packaged.yml
+  discard-paths: no

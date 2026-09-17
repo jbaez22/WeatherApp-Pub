@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Weather Dashboard — Account-level audit baseline: CloudTrail (multi-region
+  management-event trail) + GuardDuty. Deployed standalone under operator
+  credentials, not through the CI/CD pipeline's CloudFormationDeployRole —
+  deliberate separation of duties so the automated deploy role never has the
+  power to touch account-wide audit/detection controls, and so this stack
+  survives if the application stack (weather-dashboard-master-*) is ever
+  torn down. GuardDuty and multi-region CloudTrail trails are account/region
+  singletons — verify none already exist before deploying
+  (aws guardduty list-detectors / aws cloudtrail describe-trails).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - production
+      - staging
+
+  DeployCloudTrail:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      'false' for a multi-region secondary region's audit deploy
+      (docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md §2.5) -
+      CloudTrail is already a multi-region trail from the primary region
+      and covers every region including this one; deploying a second trail
+      here would be redundant. GuardDuty, unlike CloudTrail, is scoped per
+      region and always needs its own detector.
+
+Conditions:
+  ShouldDeployCloudTrail: !Equals [!Ref DeployCloudTrail, 'true']
+
+Resources:
+
+  # ── CloudTrail — S3 destination ─────────────────────────────────────────
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldDeployCloudTrail
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Access logging not needed — this bucket only stores CloudTrail's own management-event logs, which are themselves the audit trail; a second logging layer on top of an audit log destination adds cost with no security benefit"
+          - id: CKV_AWS_21
+            comment: "Versioning not enabled — CloudTrail log files are immutable, append-only objects written once and never overwritten or deleted by the trail itself; versioning protects against overwrite, which cannot happen here"
+    Properties:
+      BucketName: !Sub '${ProjectName}-cloudtrail-${AWS::AccountId}-${Environment}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldDeployCloudTrail
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  # ── CloudTrail — KMS CMK for log encryption ─────────────────────────────
+  # Key policy statements are the ones AWS documents as required for
+  # CloudTrail to actually be able to use a CMK: root gets full key
+  # management, CloudTrail itself can generate data keys (scoped to trail
+  # ARNs via the aws:cloudtrail:arn encryption context) and describe the
+  # key, and principals in this account can decrypt log files they read
+  # back out of S3.
+  CloudTrailKmsKey:
+    Type: AWS::KMS::Key
+    Condition: ShouldDeployCloudTrail
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_33
+            comment: "AllowAccountPrincipalsToDecryptLogFiles uses Principal '*' by AWS's own documented CloudTrail KMS key policy pattern, but is scoped down by the kms:CallerAccount + kms:EncryptionContext:aws:cloudtrail:arn conditions to this account's own trail only — not actually open to any AWS principal"
+    Properties:
+      Description: !Sub 'CloudTrail log encryption key for ${ProjectName}-${Environment}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIamUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudTrailToEncryptLogs
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 'kms:GenerateDataKey*'
+            Resource: '*'
+            Condition:
+              StringLike:
+                'kms:EncryptionContext:aws:cloudtrail:arn':
+                  - !Sub 'arn:aws:cloudtrail:*:${AWS::AccountId}:trail/*'
+          - Sid: AllowCloudTrailToDescribeKey
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 'kms:DescribeKey'
+            Resource: '*'
+          - Sid: AllowAccountPrincipalsToDecryptLogFiles
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:ReEncryptFrom'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:CallerAccount': !Ref AWS::AccountId
+              StringLike:
+                'kms:EncryptionContext:aws:cloudtrail:arn':
+                  - !Sub 'arn:aws:cloudtrail:*:${AWS::AccountId}:trail/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  CloudTrailKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: ShouldDeployCloudTrail
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-cloudtrail-${Environment}'
+      TargetKeyId: !Ref CloudTrailKmsKey
+
+  # ── CloudTrail — multi-region management-event trail ───────────────────
+  ManagementTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: ShouldDeployCloudTrail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${ProjectName}-trail-${Environment}'
+      S3BucketName: !Ref TrailBucket
+      KMSKeyId: !GetAtt CloudTrailKmsKey.Arn
+      IsLogging: true
+      # Multi-region costs nothing extra — a trail is billed per trail, not
+      # per region it covers — and is what the CIS AWS Foundations Benchmark
+      # actually requires (catches IAM and other global-service events a
+      # single-region trail misses). No reason to leave this false.
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── GuardDuty ────────────────────────────────────────────────────────────
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: SIX_HOURS
+
+  # ── GuardDuty findings -> SNS ────────────────────────────────────────────
+  # Without this, GuardDuty detects threats and nobody ever finds out.
+  # EventBridge rule on the default event bus (free — GuardDuty findings are
+  # a standard AWS service event, no custom bus needed) forwards every
+  # finding to email.
+  SecurityFindingsTopic:
+    Type: AWS::SNS::Topic
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_26
+            comment: "SNS topic delivers GuardDuty finding summaries (email only) — no PII or secrets in messages; KMS adds cost without security benefit"
+    Properties:
+      TopicName: !Sub '${ProjectName}-security-findings-${Environment}'
+      DisplayName: 'Weather Dashboard — GuardDuty findings'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  SecurityFindingsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SecurityFindingsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SecurityFindingsTopic
+
+  GuardDutyFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-guardduty-findings-${Environment}'
+      Description: 'Forwards every GuardDuty finding to the security SNS topic.'
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - 'GuardDuty Finding'
+      State: ENABLED
+      Targets:
+        - Id: SecurityFindingsTarget
+          Arn: !Ref SecurityFindingsTopic
+
+Outputs:
+  TrailArn:
+    Condition: ShouldDeployCloudTrail
+    Description: ARN of the multi-region CloudTrail management-event trail.
+    Value: !GetAtt ManagementTrail.Arn
+  DetectorId:
+    Description: GuardDuty detector ID for this account/region.
+    Value: !Ref GuardDutyDetector
+  SecurityFindingsTopicArn:
+    Description: SNS topic ARN GuardDuty findings are forwarded to.
+    Value: !Ref SecurityFindingsTopic

@@ -1,0 +1,148 @@
+version: 0.2
+
+# SUPERSEDED — This file is no longer used by the pipeline.
+# The pipeline was split into three focused stages. See:
+#   pipeline/buildspec/validate.yml  — Gates 1-4 (lint, security, CVE)
+#   pipeline/buildspec/test.yml      — Gate 5 (pytest + coverage)
+#   pipeline/buildspec/deploy.yml    — Package, deploy, sync, invalidate
+#
+# This file is kept for reference only.
+
+env:
+  variables:
+    COVERAGE_THRESHOLD: "80"
+    STACK_NAME: "weather-dashboard-master"
+
+phases:
+
+  install:
+    runtime-versions:
+      python: "3.11"
+      nodejs: "20"
+    commands:
+      - echo "=== Installing toolchain ==="
+      # Python tools — cfn-lint (IaC lint), checkov (IaC security), pip-audit (CVE scan), test stack
+      - pip install --quiet cfn-lint checkov pip-audit pytest pytest-cov moto requests-mock
+      # Lambda runtime dependencies (needed for packaging and local test imports)
+      - pip install --quiet -r backend/lambda/requirements.txt
+      # Architecture diagram app (React Flow / Vite)
+      - cd diagrams/interactive && npm ci --silent && cd ../..
+
+  pre_build:
+    on-failure: ABORT
+    commands:
+      - echo "=== Gate 1 — CloudFormation lint (cfn-lint) ==="
+      - cfn-lint infrastructure/cloudformation/*.yml
+
+      - echo "=== Gate 2 — CloudFormation security scan (checkov) ==="
+      - checkov -d infrastructure/cloudformation --framework cloudformation --quiet --compact
+
+      - echo "=== Gate 3 — AWS CloudFormation syntax validation ==="
+      # Exclude master.yml — local TemplateURL paths are only valid after cfn package
+      - |
+        for template in infrastructure/cloudformation/*.yml; do
+          name=$(basename "$template")
+          if [ "$name" = "master.yml" ]; then
+            echo "  Skipping $name (packaged separately)"
+            continue
+          fi
+          echo "  Validating $name..."
+          aws cloudformation validate-template --template-body "file://$template" > /dev/null
+        done
+
+      - echo "=== Gate 4 — Dependency CVE scan (pip-audit) ==="
+      # Fails the build if any known CVE is found in Lambda deps
+      - pip-audit -r backend/lambda/requirements.txt
+
+      - echo "=== Gate 5 — Unit tests + coverage gate (pytest) ==="
+      - |
+        pytest backend/tests/ -v \
+          --cov=backend/lambda \
+          --cov-report=xml:coverage.xml \
+          --cov-report=term-missing \
+          --cov-fail-under=$COVERAGE_THRESHOLD
+
+      - echo "All pre_build gates passed — proceeding to deploy."
+
+  build:
+    commands:
+      - echo "=== Package CloudFormation nested stacks ==="
+      # Uploads each nested template to S3 and replaces local TemplateURL paths
+      # with HTTPS S3 URLs in master-packaged.yml. Required before cfn deploy.
+      - |
+        aws cloudformation package \
+          --template-file infrastructure/cloudformation/master.yml \
+          --s3-bucket "$ARTIFACTS_BUCKET" \
+          --s3-prefix cloudformation \
+          --output-template-file infrastructure/cloudformation/master-packaged.yml
+
+      - echo "=== Deploy infrastructure via CloudFormation ==="
+      - bash pipeline/scripts/deploy-infrastructure.sh
+
+      - echo "=== Build and upload Lambda deployment package ==="
+      # Install Lambda deps into a temp directory, add source files, zip everything.
+      # This is the deployment package — NOT just the source files.
+      - |
+        rm -rf /tmp/lambda-pkg
+        mkdir -p /tmp/lambda-pkg
+        pip install -r backend/lambda/requirements.txt -t /tmp/lambda-pkg --quiet
+        cp backend/lambda/*.py /tmp/lambda-pkg/
+        cd /tmp/lambda-pkg && zip -r /tmp/lambda.zip . && cd "$CODEBUILD_SRC_DIR"
+        aws s3 cp /tmp/lambda.zip "s3://$ARTIFACTS_BUCKET/lambda/lambda.zip"
+        aws lambda update-function-code \
+          --function-name "$LAMBDA_FUNCTION_NAME" \
+          --s3-bucket "$ARTIFACTS_BUCKET" \
+          --s3-key lambda/lambda.zip \
+          --publish
+
+      - echo "=== Sync frontend to S3 ==="
+      # Two-pass sync: static assets get long-lived cache, HTML gets no-cache
+      # so CloudFront always fetches the latest index.html after a deploy.
+      - |
+        aws s3 sync frontend/ "s3://$WEBSITE_BUCKET/" \
+          --delete \
+          --exclude "*.html" \
+          --cache-control "max-age=86400, public"
+      - |
+        aws s3 sync frontend/ "s3://$WEBSITE_BUCKET/" \
+          --exclude "*" --include "*.html" \
+          --cache-control "no-cache, no-store, must-revalidate"
+
+      - echo "=== Build and sync architecture diagram app ==="
+      # Vite builds to dist-architecture/ at project root (see vite.config.js base:/architecture/)
+      - cd diagrams/interactive && npm run build && cd ../..
+      - |
+        aws s3 sync dist-architecture/ "s3://$WEBSITE_BUCKET/architecture/" \
+          --delete \
+          --exclude "*.html" \
+          --cache-control "max-age=86400, public"
+      - |
+        aws s3 sync dist-architecture/ "s3://$WEBSITE_BUCKET/architecture/" \
+          --exclude "*" --include "*.html" \
+          --cache-control "no-cache, no-store, must-revalidate"
+
+  post_build:
+    commands:
+      - echo "=== Invalidate CloudFront cache ==="
+      - bash pipeline/scripts/invalidate-cloudfront.sh
+
+      - |
+        echo "=== Deployment summary ==="
+        echo "  Environment  = $ENVIRONMENT"
+        echo "  Stack        = $STACK_NAME-$ENVIRONMENT"
+        echo "  Lambda       = $LAMBDA_FUNCTION_NAME"
+        echo "  Website      = https://weather.craftingnewtech.com"
+        echo "  Architecture = https://weather.craftingnewtech.com/architecture/"
+        echo "Build $CODEBUILD_BUILD_NUMBER complete."
+
+artifacts:
+  files:
+    - coverage.xml
+    - infrastructure/cloudformation/master-packaged.yml
+  discard-paths: no
+
+reports:
+  pytest-coverage:
+    files:
+      - coverage.xml
+    file-format: COBERTURAXML

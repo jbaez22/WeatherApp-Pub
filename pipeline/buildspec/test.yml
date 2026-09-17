@@ -1,0 +1,47 @@
+version: 0.2
+
+# Stage: Test
+# Gate 5: pytest unit tests with 80% coverage requirement.
+# No deploy actions. Coverage report published to CodeBuild Reports.
+# Node.js not required; Python 3.11 only.
+
+env:
+  variables:
+    COVERAGE_THRESHOLD: "80"
+
+phases:
+
+  install:
+    runtime-versions:
+      # Kept at 3.11 deliberately — this stage imports and runs
+      # backend/lambda/*.py directly, so it must match the Lambda
+      # function's deployed Runtime (still python3.11) to be a faithful
+      # test. Bump this only together with the Lambda's own Runtime
+      # property, not independently.
+      python: "3.11"
+    commands:
+      - pip install --quiet pytest pytest-cov moto requests-mock
+      - pip install --quiet -r backend/lambda/requirements.txt
+
+  build:
+    on-failure: ABORT
+    commands:
+      - echo "=== Gate 5 — Unit tests + coverage gate (pytest) ==="
+      - |
+        pytest backend/tests/ -v \
+          --cov=backend/lambda \
+          --cov-report=xml:coverage.xml \
+          --cov-report=term-missing \
+          --cov-fail-under=$COVERAGE_THRESHOLD
+      - echo "All tests passed."
+
+artifacts:
+  files:
+    - coverage.xml
+  discard-paths: no
+
+reports:
+  pytest-coverage:
+    files:
+      - coverage.xml
+    file-format: COBERTURAXML

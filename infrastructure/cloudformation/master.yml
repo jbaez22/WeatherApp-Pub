@@ -1,0 +1,441 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — Master (Root) Nested Stack.
+  Orchestrates all infrastructure sub-stacks in dependency order.
+  Deploy this template via `aws cloudformation package` followed by
+  `aws cloudformation deploy` — the package step uploads nested templates
+  to S3 and replaces local TemplateURL paths with HTTPS S3 URLs.
+
+  Deployment order (CloudFormation resolves from !GetAtt dependencies):
+    1. Database (04) → 2. SSM (07) → 3. Storage (02) → 4. IAM (01)
+    → 5. Backend (05) → 6. API (06) → 7. CDN (03)
+    → 8. Pipeline Infra (08) / 8b. Pipeline App (08b) → 9. Monitoring (09)
+  PipelineStack and AppPipelineStack have no dependency on each other (both
+  compute the other pipeline's name via Sub, not GetAtt) — CloudFormation
+  may create them in either order.
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier propagated to all sub-stacks for naming and tagging.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment.
+
+  # ── CDN / DNS ──────────────────────────────────────────────────────────────
+  AcmCertificateArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of a pre-existing ACM certificate for weather.craftingnewtech.com
+      (must be in us-east-1). Only required when HostedZoneId is NOT provided
+      (domain managed outside Route 53). When HostedZoneId IS provided,
+      the certificate is created and DNS-validated automatically by CloudFormation
+      — leave this blank.
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: >
+      Route 53 hosted zone ID for craftingnewtech.com. When provided, a
+      weather.craftingnewtech.com ALIAS record is created automatically.
+      Leave blank to create the DNS record manually after deployment.
+
+  AlternateDomainName:
+    Type: String
+    Default: 'weather.craftingnewtech.com'
+    Description: Custom domain. Must match the SAN on AcmCertificateArn.
+
+  # ── Lambda ─────────────────────────────────────────────────────────────────
+  LambdaZipKey:
+    Type: String
+    Default: 'lambda/lambda.zip'
+    Description: >
+      S3 key of the Lambda deployment ZIP within the artifacts bucket.
+      Bootstrap must upload this file before deploying the master stack:
+        pip install -r backend/lambda/requirements.txt -t /tmp/pkg
+        cp backend/lambda/*.py /tmp/pkg && cd /tmp/pkg
+        zip -r lambda.zip . && cd -
+        aws s3 cp /tmp/pkg/lambda.zip s3://<ArtifactsBucket>/lambda/lambda.zip
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024]
+    Description: Lambda memory in MB.
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 60
+    Description: Lambda timeout in seconds.
+
+  LambdaReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 1000
+    Description: Lambda reserved concurrency cap.
+
+  # ── Pipeline ───────────────────────────────────────────────────────────────
+  BranchName:
+    Type: String
+    Default: main
+    Description: CodeCommit branch that triggers the CI/CD pipeline.
+
+  # ── Monitoring ─────────────────────────────────────────────────────────────
+  LambdaErrorThreshold:
+    Type: Number
+    Default: 5
+    Description: Lambda errors per 5 minutes before alarm triggers.
+
+  Api5xxThreshold:
+    Type: Number
+    Default: 3
+    Description: API Gateway 5xx errors per 5 minutes before alarm triggers.
+
+  Api4xxThreshold:
+    Type: Number
+    Default: 50
+    Description: API Gateway 4xx errors per 5 minutes before alarm triggers.
+
+  # ── Shared ─────────────────────────────────────────────────────────────────
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+    Description: CloudWatch log retention for all log groups in this deployment.
+
+  SecondaryRegion:
+    Type: String
+    Default: ''
+    Description: >
+      Multi-region failover region (e.g. us-west-2). Passed through to
+      IamStack to widen LambdaExecutionRole's DynamoDB/Secrets Resource ARNs.
+      Leave blank until Phase 2 of
+      docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md.
+
+  SecondaryArtifactsBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      Name of the secondary region's own artifacts bucket (from that
+      region's 00-bootstrap.yml). Passed through to IamStack (as an ARN) to
+      widen InfraCodeBuildRole/AppCodeBuildRole's S3 access, and to
+      PipelineStack/AppPipelineStack for their new DeploySecondary stages.
+      Leave blank until Phase 2 §2.6/§2.7.
+
+  PrimaryHealthCheckId:
+    Type: String
+    Default: ''
+    Description: >
+      Route 53 health check ID from the standalone
+      weather-dashboard-failover-dns-production stack (multi-region plan
+      §3.1/§4.4). Passed through to MonitoringStack. Leave blank until
+      Phase 3.
+
+# ── Conditions ───────────────────────────────────────────────────────────────
+Conditions:
+  HasSecondaryArtifactsBucket: !Not [!Equals [!Ref SecondaryArtifactsBucketName, '']]
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, '']]
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── 1. DynamoDB Cache ──────────────────────────────────────────────────────
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./04-database.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 2. SSM Parameter Store ─────────────────────────────────────────────────
+  # DependsOn: IamStack — SsmStack's resources (Phase 4.2's SecretsKmsKey)
+  # need permissions only IamStack grants, but neither stack references
+  # the other's outputs, so CloudFormation has no data dependency to order
+  # them by and can run them concurrently by default. Without this explicit
+  # DependsOn, that's a real race: SsmStack can call kms:CreateKey before
+  # IamStack's permission grant has actually landed — hit this exact race
+  # live after fixing the earlier GetAtt-based circular dependency deadlock
+  # (see 01-iam.yml's SsmParameterAccess/SecretsManagerAccess comments).
+  # One-directional only: IamStack must NOT depend back on SsmStack, or
+  # the deadlock returns.
+  SsmStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: IamStack
+    Properties:
+      TemplateURL: ./07-ssm.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        ReplicaRegion: !Ref SecondaryRegion
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 3. S3 Buckets ──────────────────────────────────────────────────────────
+  StorageStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./02-storage.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        # Artifacts bucket is pre-created during bootstrap so the Lambda ZIP
+        # can be uploaded before the stack deploys. CFN adopts it via policy only.
+        ExistingArtifactsBucketName: !Sub '${ProjectName}-artifacts-${AWS::AccountId}-${Environment}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 4. IAM Roles ───────────────────────────────────────────────────────────
+  # Depends on Database, SSM, and Storage stacks via !GetAtt output references.
+  # CloudFormation resolves this implicitly — no DependsOn needed.
+  IamStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./01-iam.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        DynamoDBTableArn: !GetAtt DatabaseStack.Outputs.TableArn
+        # SsmParameterArn/SecretArn are no longer passed here — 01-iam.yml
+        # computes both ARNs itself from ProjectName now, deliberately
+        # decoupling IamStack from SsmStack. The prior GetAtt-based wiring
+        # forced CloudFormation to update SsmStack before IamStack (output
+        # resolution requires the referenced stack to finish first), which
+        # deadlocked once SsmStack grew a resource (SecretsKmsKey,
+        # Phase 4.2) that needed a permission only IamStack grants — found
+        # via two live deploy failures. See 01-iam.yml's SsmParameterAccess
+        # / SecretsManagerAccess policy comments for the full explanation.
+        ArtifactsBucketArn: !GetAtt StorageStack.Outputs.ArtifactsBucketArn
+        WebsiteBucketArn: !GetAtt StorageStack.Outputs.WebsiteBucketArn
+        SecondaryRegion: !Ref SecondaryRegion
+        SecondaryArtifactsBucketArn: !If
+          - HasSecondaryArtifactsBucket
+          - !Sub 'arn:aws:s3:::${SecondaryArtifactsBucketName}'
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 5. Lambda Function ─────────────────────────────────────────────────────
+  BackendStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./05-backend.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        LambdaExecutionRoleArn: !GetAtt IamStack.Outputs.LambdaExecutionRoleArn
+        DynamoDBTableName: !GetAtt DatabaseStack.Outputs.TableName
+        SecretName: !GetAtt SsmStack.Outputs.SecretName
+        AllowedOrigin: !Sub 'https://${AlternateDomainName}'
+        ArtifactsBucketName: !GetAtt StorageStack.Outputs.ArtifactsBucketName
+        LambdaZipKey: !Ref LambdaZipKey
+        MemorySize: !Ref LambdaMemorySize
+        TimeoutSeconds: !Ref LambdaTimeoutSeconds
+        ReservedConcurrency: !Ref LambdaReservedConcurrency
+        LogRetentionDays: !Ref LogRetentionDays
+        SecondaryRegion: !Ref SecondaryRegion
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 6. API Gateway ─────────────────────────────────────────────────────────
+  ApiStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./06-api.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        LambdaAliasArn: !GetAtt BackendStack.Outputs.LambdaAliasArn
+        LambdaFunctionName: !GetAtt BackendStack.Outputs.LambdaFunctionName
+        AllowedOrigin: !Sub 'https://${AlternateDomainName}'
+        LogRetentionDays: !Ref LogRetentionDays
+        HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 7. CloudFront CDN ──────────────────────────────────────────────────────
+  CdnStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./03-cdn.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        WebsiteBucketName: !GetAtt StorageStack.Outputs.WebsiteBucketName
+        WebsiteBucketDomainName: !GetAtt StorageStack.Outputs.WebsiteBucketDomainName
+        AcmCertificateArn: !Ref AcmCertificateArn
+        AlternateDomainName: !Ref AlternateDomainName
+        HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 8. CI/CD Pipeline — Infrastructure ─────────────────────────────────────
+  # WebsiteBucketName/LambdaFunctionName/CloudFrontDistributionId/ApiEndpoint
+  # removed from this stack's parameters — those moved to AppPipelineStack
+  # below along with the App pipeline's Deploy/ValidateDeployment stages.
+  PipelineStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./08-pipeline.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        ArtifactsBucketName: !GetAtt StorageStack.Outputs.ArtifactsBucketName
+        InfraCodeBuildRoleArn: !GetAtt IamStack.Outputs.InfraCodeBuildRoleArn
+        CodePipelineServiceRoleArn: !GetAtt IamStack.Outputs.CodePipelineServiceRoleArn
+        CloudFormationDeployRoleArn: !GetAtt IamStack.Outputs.CloudFormationDeployRoleArn
+        PipelineFilterLambdaRoleArn: !GetAtt IamStack.Outputs.PipelineFilterLambdaRoleArn
+        BranchName: !Ref BranchName
+        LogRetentionDays: !Ref LogRetentionDays
+        SecondaryArtifactsBucketName: !Ref SecondaryArtifactsBucketName
+        SecondaryHostedZoneId: !Ref HostedZoneId
+        SecondaryRegion: !Ref SecondaryRegion
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 8b. CI/CD Pipeline — Application ────────────────────────────────────────
+  # No DependsOn / GetAtt to or from PipelineStack — both templates compute
+  # the other pipeline's name via Sub, so deploy order between them is
+  # arbitrary (see docs/WeatherApp-PipeSplit-ImplePlan-V1.md §B.6 and the
+  # nested-stack GetAtt deadlock pattern this avoids).
+  AppPipelineStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./08b-app-pipeline.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        ArtifactsBucketName: !GetAtt StorageStack.Outputs.ArtifactsBucketName
+        AppCodeBuildRoleArn: !GetAtt IamStack.Outputs.AppCodeBuildRoleArn
+        CodePipelineServiceRoleArn: !GetAtt IamStack.Outputs.CodePipelineServiceRoleArn
+        PipelineReleaseLambdaRoleArn: !GetAtt IamStack.Outputs.PipelineReleaseLambdaRoleArn
+        WebsiteBucketName: !GetAtt StorageStack.Outputs.WebsiteBucketName
+        LambdaFunctionName: !GetAtt BackendStack.Outputs.LambdaFunctionName
+        CloudFrontDistributionId: !GetAtt CdnStack.Outputs.DistributionId
+        ApiEndpoint: !GetAtt ApiStack.Outputs.ApiEndpoint
+        FrontendDomain: !Ref AlternateDomainName
+        BranchName: !Ref BranchName
+        LogRetentionDays: !Ref LogRetentionDays
+        SecondaryArtifactsBucketName: !Ref SecondaryArtifactsBucketName
+        SecondaryRegion: !Ref SecondaryRegion
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 9. Monitoring ──────────────────────────────────────────────────────────
+  MonitoringStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./09-monitoring.yml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        LambdaFunctionName: !GetAtt BackendStack.Outputs.LambdaFunctionName
+        ApiId: !GetAtt ApiStack.Outputs.ApiId
+        LambdaErrorThreshold: !Ref LambdaErrorThreshold
+        Api5xxThreshold: !Ref Api5xxThreshold
+        Api4xxThreshold: !Ref Api4xxThreshold
+        PrimaryHealthCheckId: !Ref PrimaryHealthCheckId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  WebsiteUrl:
+    Description: Weather dashboard URL (custom domain).
+    Value: !GetAtt CdnStack.Outputs.WebsiteUrl
+
+  CloudFrontDomain:
+    Description: CloudFront-assigned domain for smoke testing before DNS cuts over.
+    Value: !GetAtt CdnStack.Outputs.DistributionDomainName
+
+  ApiEndpoint:
+    Description: >
+      API Gateway base URL. After bootstrap, set this as API_BASE_URL in
+      frontend/js/config.js, rebuild the frontend, and sync to S3.
+    Value: !GetAtt ApiStack.Outputs.ApiEndpoint
+
+  ApiRegionalDomainName:
+    Condition: HasHostedZone
+    Description: >
+      Regional target for the Route 53 Failover ALIAS record (multi-region
+      plan §3.1/§3.2) — read live, not hardcoded, since it varies by region.
+    Value: !GetAtt ApiStack.Outputs.ApiRegionalDomainName
+
+  ApiRegionalHostedZoneId:
+    Condition: HasHostedZone
+    Description: Hosted zone ID for the regional domain target above.
+    Value: !GetAtt ApiStack.Outputs.ApiRegionalHostedZoneId
+
+  WeatherEndpoint:
+    Description: 'Full GET /weather endpoint for smoke-test: curl <url>?city=London'
+    Value: !GetAtt ApiStack.Outputs.WeatherEndpoint
+
+  CodeCommitCloneUrl:
+    Description: >
+      HTTPS CodeCommit clone URL. Push to the main branch to trigger the
+      CI/CD pipeline. Use git-remote-codecommit for credential-free cloning:
+        pip install git-remote-codecommit
+        git clone codecommit::us-east-1://weather-dashboard
+    Value: !GetAtt PipelineStack.Outputs.RepositoryCloneUrlHttp
+
+  AlarmTopicArn:
+    Description: >
+      SNS alarm notification topic. Subscribe your email:
+        aws sns subscribe --topic-arn <this ARN> \
+          --protocol email --notification-endpoint you@example.com
+    Value: !GetAtt MonitoringStack.Outputs.AlarmTopicArn
+
+  DeployApprovalTopicArn:
+    Description: >
+      SNS topic for deploy approval requests. Subscribe your email:
+        aws sns subscribe --topic-arn <this ARN> \
+          --protocol email --notification-endpoint you@example.com
+    Value: !GetAtt PipelineStack.Outputs.DeployApprovalTopicArn
+
+  DashboardUrl:
+    Description: Direct link to the CloudWatch dashboard.
+    Value: !Sub >-
+      https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}

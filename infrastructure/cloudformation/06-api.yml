@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — API Gateway HTTP API (v2).
+  Provides the GET /weather endpoint with CORS locked to the CloudFront
+  domain, per-stage throttling, and CloudWatch access logging.
+  Receives Lambda coordinates from the parent (master) stack via Parameters.
+
+# ── Parameters ──────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier used in resource names and tags.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - production
+      - staging
+    Description: Deployment environment — controls naming and throttle defaults.
+
+  LambdaAliasArn:
+    Type: String
+    Description: >
+      ARN of the weather-handler Lambda "live" alias (Phase 2.1).
+      Passed in by master.yml from the 05-backend stack output
+      LambdaAliasArn. API Gateway invokes the alias, not the bare function,
+      so traffic can move between versions without touching this stack.
+
+  LambdaFunctionName:
+    Type: String
+    Description: >
+      Name of the weather-handler Lambda function.
+      Required to scope the Lambda::Permission SourceArn correctly.
+
+  AllowedOrigin:
+    Type: String
+    Default: 'https://weather.craftingnewtech.com'
+    Description: >
+      CORS allowed origin. Must match the CloudFront alternate domain exactly.
+      A wildcard (*) is intentionally NOT used — this is a security control.
+
+  ThrottlingBurstLimit:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 5000
+    Description: >
+      Maximum concurrent requests API Gateway allows before throttling (token
+      bucket burst capacity).
+
+  ThrottlingRateLimit:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 10000
+    Description: >
+      Steady-state requests per second before throttling kicks in.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+    Description: CloudWatch log retention period for API access logs (days).
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: >
+      Route 53 hosted zone for craftingnewtech.com. Leave blank to skip
+      creating the api.* regional custom domain (e.g. staging). Used by
+      docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md §1.4/§3 —
+      Route 53 Failover routing targets this domain directly, since
+      CloudFront never proxies API traffic (see that plan's §0.2 #1).
+
+  ApiSubdomain:
+    Type: String
+    Default: 'api.weather.craftingnewtech.com'
+    Description: >
+      Regional custom domain for this API. Same value in every region —
+      Route 53 Failover routing (not this stack) decides which region's
+      regional domain target is live at any given time.
+
+  IsPrimaryRegion:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      'false' when this stack is deployed as the multi-region secondary
+      (master-secondary.yml). In the secondary region the MonitoringStack
+      (09-monitoring.yml) is NOT deployed, so the two CloudWatch alarms the
+      CodeDeploy canary path depends on — lambda-errors and api-5xx — would
+      not otherwise exist there. The deployment group's alarmConfiguration
+      (05-backend.yml, ignorePollAlarmFailure=false) polls both, and the
+      post-traffic hook reads lambda-errors' state; with the alarms absent
+      the post-traffic hook crashed (list index out of range) and the
+      secondary canary deployment failed. When 'false' this stack creates
+      those two alarms so the secondary canary path is self-consistent.
+      Found live 2026-07-29 on the first-ever real (non-bootstrap) secondary
+      canary deployment.
+
+# ── Conditions ───────────────────────────────────────────────────────────────
+Conditions:
+  CreateApiDomain: !Not [!Equals [!Ref HostedZoneId, '']]
+  # Only the secondary region creates these alarms here — in the primary
+  # region they already exist in MonitoringStack (09-monitoring.yml), which
+  # secondary never deploys.
+  CreateSecondaryDeployAlarms: !Equals [!Ref IsPrimaryRegion, 'false']
+
+# ── Resources ────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── CloudWatch Log Group ─────────────────────────────────────────────────
+  # Retain on stack delete so logs survive accidental teardown.
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs are encrypted by default with AWS-managed keys; KMS CMK adds ~$1/month per key without meaningful benefit"
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ── HTTP API ─────────────────────────────────────────────────────────────
+  # HTTP API (v2) is ~70 % cheaper than REST API and supports Lambda proxy
+  # natively. CORS is configured at the API level here — routes inherit it.
+  WeatherApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: 'Weather Dashboard — GET /weather?city={city}'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref AllowedOrigin
+        AllowMethods:
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - X-Requested-With
+        MaxAge: 86400
+        AllowCredentials: false
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ── Lambda Proxy Integration ──────────────────────────────────────────────
+  # PayloadFormatVersion 2.0 is the HTTP API default — aligns with the event
+  # shape that weather_handler.py parses (requestContext.http.method).
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WeatherApi
+      Description: 'Lambda proxy — weather_handler.py'
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub
+        - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations'
+        - Arn: !Ref LambdaAliasArn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+
+  # ── Routes ────────────────────────────────────────────────────────────────
+  WeatherRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WeatherApi
+      RouteKey: 'GET /weather'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: NONE
+
+  # Reverse-geocode: resolves lat/lon to a city name for the location button.
+  LocateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WeatherApi
+      RouteKey: 'GET /locate'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: NONE
+
+  # Liveness/region check — Route 53's failover health check polls this
+  # (docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md §1.1).
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WeatherApi
+      RouteKey: 'GET /health'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: NONE
+
+  # ── Default Stage ─────────────────────────────────────────────────────────
+  # $default stage with AutoDeploy so every API change is live immediately.
+  # Throttling is applied at the stage level and inherited by all routes.
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WeatherApi
+      StageName: '$default'
+      Description: !Sub '${ProjectName} ${Environment} stage'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: !Ref ThrottlingBurstLimit
+        ThrottlingRateLimit: !Ref ThrottlingRateLimit
+        DetailedMetricsEnabled: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","integrationLatency":"$context.integrationLatency","responseLatency":"$context.responseLatency","errorMessage":"$context.error.message"}'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ── Lambda Permission ─────────────────────────────────────────────────────
+  # Grants API Gateway the right to invoke the Lambda alias (not the bare
+  # function — Lambda scopes invoke permissions per-qualifier, so this must
+  # target the ":live" alias explicitly to match the alias-qualified
+  # IntegrationUri above, or API Gateway gets AccessDeniedException).
+  # SourceArn is scoped to this specific API to prevent confused-deputy risk.
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Sub '${LambdaFunctionName}:live'
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WeatherApi}/*'
+
+  # ── Regional Custom Domain (Multi-Region Failover) ────────────────────────
+  # API Gateway HTTP API v2 has no edge-optimized option — this is a
+  # REGIONAL custom domain, so its cert must be issued in THIS region (unlike
+  # 03-cdn.yml's CloudFront cert, which must be us-east-1 regardless of
+  # deploy region). Route 53 Failover routing (deployed separately, see
+  # docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md §3) targets
+  # this domain's RegionalDomainName/RegionalHostedZoneId in each region —
+  # CloudFront is not in this request path at all (§0.2 #1).
+  ApiCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: CreateApiDomain
+    Properties:
+      DomainName: !Ref ApiSubdomain
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref ApiSubdomain
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApiCustomDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: CreateApiDomain
+    Properties:
+      DomainName: !Ref ApiSubdomain
+      DomainNameConfigurations:
+        - CertificateArn: !Ref ApiCertificate
+          EndpointType: REGIONAL
+
+  ApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: CreateApiDomain
+    Properties:
+      ApiId: !Ref WeatherApi
+      DomainName: !Ref ApiCustomDomain
+      Stage: !Ref ApiStage
+
+  # ── Secondary-region CodeDeploy canary alarms ──────────────────────────────
+  # Created ONLY in the secondary region (CreateSecondaryDeployAlarms). In the
+  # primary region these two alarms live in MonitoringStack (09-monitoring.yml);
+  # secondary never deploys that stack, so without these the secondary canary
+  # path breaks (see IsPrimaryRegion parameter comment above). Same names,
+  # metrics, thresholds and TreatMissingData as their primary counterparts so
+  # the deployment group's alarm poll and the post-traffic hook behave
+  # identically in both regions. No AlarmActions here — there is no SNS topic
+  # in the secondary region (that also lives in MonitoringStack); the alarm
+  # STATE is what the CodeDeploy poll and the hook read, notifications are not
+  # required for the deploy-safety role. (Wiring secondary alarm notifications
+  # to an SNS topic is a possible future refinement, tracked separately.)
+  SecondaryLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSecondaryDeployAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: !Sub >-
+        [secondary region] Lambda function ${LambdaFunctionName} exceeded 5
+        errors in a 5-minute window. Polled by the CodeDeploy deployment
+        group and read by the post-traffic hook during a canary deploy.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  SecondaryApi5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSecondaryDeployAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-5xx-${Environment}'
+      AlarmDescription: !Sub >-
+        [secondary region] API Gateway ${WeatherApi} exceeded 3 5xx errors in
+        5 minutes. Polled by the CodeDeploy deployment group during a canary
+        deploy.
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref WeatherApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ── Outputs ──────────────────────────────────────────────────────────────────
+Outputs:
+
+  ApiId:
+    Description: 'HTTP API ID — referenced by 09-monitoring.yml for alarms.'
+    Value: !Ref WeatherApi
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiId'
+
+  ApiEndpoint:
+    Description: >
+      Base invoke URL. Paste into frontend/js/config.js API_BASE_URL after
+      bootstrap: https://{id}.execute-api.{region}.amazonaws.com
+    Value: !GetAtt WeatherApi.ApiEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  WeatherEndpoint:
+    Description: 'Full GET /weather URL — for smoke-test curl commands.'
+    Value: !Sub '${WeatherApi.ApiEndpoint}/weather'
+    Export:
+      Name: !Sub '${AWS::StackName}-WeatherEndpoint'
+
+  ApiAccessLogGroupName:
+    Description: 'CloudWatch log group name for API access logs.'
+    Value: !Ref ApiAccessLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiLogGroup'
+
+  ApiStageArn:
+    Description: 'Stage ARN — used by CloudWatch alarms in 09-monitoring.yml.'
+    Value: !Sub 'arn:aws:apigateway:${AWS::Region}::/apis/${WeatherApi}/stages/$default'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiStageArn'
+
+  ApiRegionalDomainName:
+    Condition: CreateApiDomain
+    Description: >
+      Regional target for Route 53 Failover ALIAS records — do not hardcode,
+      read live (varies by region/deploy).
+    Value: !GetAtt ApiCustomDomain.RegionalDomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiRegionalDomainName'
+
+  ApiRegionalHostedZoneId:
+    Condition: CreateApiDomain
+    Description: >
+      Hosted zone ID for the regional domain target above — required by a
+      Route 53 ALIAS record's AliasTarget.HostedZoneId. Varies by region;
+      read live, never hardcode (see plan §3.1).
+    Value: !GetAtt ApiCustomDomain.RegionalHostedZoneId
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiRegionalHostedZoneId'

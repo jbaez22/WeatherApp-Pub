@@ -1,0 +1,763 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Dashboard — Infrastructure CI/CD Pipeline (CodeCommit + CodeBuild +
+  CodePipeline). Five stages: Source (CodeCommit) → Validate (IaC lint +
+  security scan + syntax check) → ApproveDeploy (manual) → Deploy (cfn
+  package/deploy the 9 nested stacks) → ValidateDeployment (stack drift +
+  output check). Application code delivery (Lambda, frontend, CDN) lives in
+  the separate App pipeline — see 08b-app-pipeline.yml.
+  Each stage runs in its own CodeBuild project so failures pinpoint immediately
+  to the stage that broke — no log diving required.
+  Trigger: EventBridge → Lambda filter (routes by changed path, skips
+  docs-only commits) → this pipeline and/or the App pipeline.
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: weather-dashboard
+    Description: Short identifier used in resource names and tags.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment.
+
+  ArtifactsBucketName:
+    Type: String
+    Description: >
+      S3 bucket for pipeline artifact staging (from 02-storage stack).
+
+  InfraCodeBuildRoleArn:
+    Type: String
+    Description: >
+      Infra CodeBuild role ARN (from 01-iam stack). Renamed from
+      CodeBuildServiceRoleArn — see docs/WeatherApp-PipeSplit-ImplePlan-V1.md
+      Deploy A / §A.5.
+
+  CodePipelineServiceRoleArn:
+    Type: String
+    Description: CodePipeline service role ARN (from 01-iam stack).
+
+  CloudFormationDeployRoleArn:
+    Type: String
+    Description: >
+      CloudFormation deploy role ARN (from 01-iam stack). Passed to the Deploy
+      stage via CFN_DEPLOY_ROLE_ARN environment variable.
+
+  PipelineFilterLambdaRoleArn:
+    Type: String
+    Description: Pipeline filter Lambda role ARN (from 01-iam stack).
+
+  BranchName:
+    Type: String
+    Default: main
+    Description: CodeCommit branch that triggers the pipeline.
+
+  BuildImage:
+    Type: String
+    Default: 'aws/codebuild/standard:7.0'
+    Description: CodeBuild managed image (Python 3.11, Node.js 20).
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+    Description: CloudWatch log retention for all CodeBuild log groups.
+
+  SecondaryArtifactsBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      us-west-2 artifacts bucket name (from that region's own 00-bootstrap.yml).
+      Adds a DeploySecondary stage that packages/deploys master-secondary.yml
+      to us-west-2 (docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md
+      §2.6). This is a same-region CodeBuild action making AWS CLI calls with
+      --region us-west-2 - NOT CodePipeline's cross-region ArtifactStores/
+      Region-property feature, which turned out to be unneeded machinery
+      here (see that section's design note). Leave blank to skip.
+
+  SecondaryHostedZoneId:
+    Type: String
+    Default: ''
+    Description: >
+      Passed through to master-secondary.yml's HostedZoneId parameter on
+      every DeploySecondary run.
+
+  SecondaryRegion:
+    Type: String
+    Default: 'us-west-2'
+
+# ── Conditions ───────────────────────────────────────────────────────────────
+Conditions:
+  HasSecondaryDeploy: !Not [!Equals [!Ref SecondaryArtifactsBucketName, '']]
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── CodeCommit Repository ──────────────────────────────────────────────────
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref ProjectName
+      RepositoryDescription: >
+        Weather Dashboard — AWS-native serverless weather app.
+        Push to main to trigger the full CI/CD pipeline.
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── CloudWatch Log Groups ──────────────────────────────────────────────────
+  # One log group per stage — failures are isolated and easy to find.
+
+  ValidateLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypted by default; KMS CMK adds cost without benefit for build logs"
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-infra-validate-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  DeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypted by default; KMS CMK adds cost without benefit for build logs"
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-infra-deploy-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  ValidateDeploymentLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypted by default; KMS CMK adds cost without benefit for build logs"
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-infra-validate-deployment-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  DeploySecondaryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasSecondaryDeploy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypted by default; KMS CMK adds cost without benefit for build logs"
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-infra-deploy-secondary-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ── Manual Approval — SNS Topic ────────────────────────────────────────────
+  # Every deploy pauses at the ApproveDeploy stage and notifies this topic.
+  # Subscribe after this stack deploys:
+  #   aws sns subscribe --topic-arn <DeployApprovalTopicArn> \
+  #     --protocol email --notification-endpoint you@example.com
+  DeployApprovalTopic:
+    Type: AWS::SNS::Topic
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_26
+            comment: "SNS topic delivers deploy-approval notifications (email only) — no PII or secrets in messages; KMS adds cost without security benefit"
+    Properties:
+      TopicName: !Sub '${ProjectName}-deploy-approval-${Environment}'
+      DisplayName: 'Weather Dashboard — deploy approval requests'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Stage 2: Validate — CodeBuild Project ─────────────────────────────────
+  # Gates 1-3: cfn-lint, checkov, aws cloudformation validate-template.
+  # Gate 4 (pip-audit) moved to the App pipeline's Validate stage — it scans
+  # backend/lambda/requirements.txt, an app concern, not an infra one.
+  # Python 3.14 only — no Node.js needed, so this stage starts fast.
+  ValidateProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-infra-validate-${Environment}'
+      Description: 'IaC lint and security scan. Fails fast before any deploy.'
+      ServiceRole: !Ref InfraCodeBuildRoleArn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec/validate-infra.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref BuildImage
+        PrivilegedMode: false
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref ValidateLogGroup
+          Status: ENABLED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Stage 3: Deploy — CodeBuild Project ───────────────────────────────────
+  # Runs only after Validate succeeds. cfn package → cfn deploy only — no
+  # Lambda/frontend/CloudFront actions, those moved to the App pipeline.
+  # Python only, no Node.js needed.
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-infra-deploy-${Environment}'
+      Description: 'Package and deploy the 9 nested CloudFormation stacks.'
+      ServiceRole: !Ref InfraCodeBuildRoleArn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec/deploy-infra.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref BuildImage
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ARTIFACTS_BUCKET
+            Value: !Ref ArtifactsBucketName
+          - Name: CFN_DEPLOY_ROLE_ARN
+            Value: !Ref CloudFormationDeployRoleArn
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref DeployLogGroup
+          Status: ENABLED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Stage 3b: DeploySecondary — CodeBuild Project (multi-region) ──────────
+  # Same-region CodeBuild action (runs in this pipeline's own region, like
+  # every other stage) whose buildspec makes AWS CLI calls with
+  # --region us-west-2 — the same pattern proven working manually in tasks
+  # 2.1/2.3/2.5. Reuses InfraCodeBuildRole (already widened to the secondary
+  # bucket, and CloudFormationDeployRole's policy is Resource: '*' — not
+  # region-scoped, see plan §0.2 #9), so no new IAM role was needed.
+  DeploySecondaryProject:
+    Type: AWS::CodeBuild::Project
+    Condition: HasSecondaryDeploy
+    Properties:
+      Name: !Sub '${ProjectName}-infra-deploy-secondary-${Environment}'
+      Description: 'Package and deploy master-secondary.yml to the multi-region failover region.'
+      ServiceRole: !Ref InfraCodeBuildRoleArn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec/deploy-infra-secondary.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref BuildImage
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: SECONDARY_ARTIFACTS_BUCKET
+            Value: !Ref SecondaryArtifactsBucketName
+          - Name: CFN_DEPLOY_ROLE_ARN
+            Value: !Ref CloudFormationDeployRoleArn
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: SECONDARY_REGION
+            Value: !Ref SecondaryRegion
+          - Name: SECONDARY_HOSTED_ZONE_ID
+            Value: !Ref SecondaryHostedZoneId
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref DeploySecondaryLogGroup
+          Status: ENABLED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Stage 4: ValidateDeployment — CodeBuild Project ───────────────────────
+  # Runs AFTER Deploy. Stack drift + output check — confirms the CFN update
+  # landed cleanly. No HTTP call against the live API — that's the App
+  # pipeline's SmokeTest job (validate-deployment.yml), since only App
+  # deploys touch the Lambda/API surface that check exercises.
+  ValidateDeploymentProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-infra-validate-deployment-${Environment}'
+      Description: 'Post-deploy stack drift check and output verification.'
+      ServiceRole: !Ref InfraCodeBuildRoleArn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: pipeline/buildspec/validate-infra-deployment.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref BuildImage
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Value: !Sub 'weather-dashboard-master-${Environment}'
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref ValidateDeploymentLogGroup
+          Status: ENABLED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Pipeline Filter Lambda — Log Group ────────────────────────────────────
+  FilterFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypted by default; KMS CMK adds cost without benefit for this Lambda log"
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-pipeline-filter-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ── Pipeline Filter Lambda ─────────────────────────────────────────────────
+  # Invoked by EventBridge on every push to main.
+  # Calls codecommit:GetDifferences to inspect changed file paths, classifies
+  # them as infra/app/docs, and routes to the Infra pipeline, the App
+  # pipeline (08b-app-pipeline.yml), both, or neither. Applies
+  # ~/.claude/instructions/pipeline-topology.md's self-referential rule:
+  # pipeline/** and infrastructure/cloudformation/** both count as infra
+  # paths, since a buildspec edit is a pipeline-definition change even when
+  # its own content is deploy-app.yml.
+  #
+  # Both pipeline names are computed via Sub, not GetAtt from
+  # AppPipelineStack — the same anti-deadlock trick already used for
+  # SecretsManagerAccess in 01-iam.yml (see
+  # docs/WeatherApp-PipeSplit-ImplePlan-V1.md §B.4) — so this template and
+  # 08b-app-pipeline.yml never need each other's CloudFormation outputs.
+  #
+  # Fail-safe: any unexpected input (empty diff, truly new branch, an
+  # unrecognized path) starts both pipelines rather than silently
+  # under-triggering.
+  #
+  # CAUTION — oldCommitId can be absent on a genuine referenceUpdated push,
+  # not just on real new-branch creation. `git push` over git-remote-codecommit
+  # generates two CodeCommit "GitPush" calls per push (a protocol-negotiation
+  # call with no commit data, then the real one) — confirmed via CloudTrail on
+  # 2026-07-13. CodeCommit/EventBridge can deliver the malformed one to this
+  # Lambda instead of the real one, with commitId set but oldCommitId missing,
+  # which looks identical to a new-branch push. This caused a docs-only commit
+  # to run the full pipeline unconditionally (see
+  # docs/WeatherApp-ImproveDeploys-Plan-V2.md, "Correction — pipeline filter
+  # false new-branch trigger"). Do not treat a missing oldCommitId alone as
+  # proof of a new branch — recover it from the new commit's own parent first.
+  PipelineFilterFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FilterFunctionLogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_116
+            comment: "DLQ not warranted — filter failures are logged; fail-safe logic starts both pipelines when uncertain"
+          - id: CKV_AWS_117
+            comment: "VPC not required — function only calls AWS service APIs via service endpoints"
+          - id: CKV_AWS_50
+            comment: "X-Ray tracing not required for a lightweight internal filter function"
+          - id: CKV_AWS_115
+            comment: "Reserved concurrency not set — function is low-volume (fires only on git pushes); throttling would block pipeline more than help"
+          - id: CKV_AWS_173
+            comment: "KMS encryption not required — env vars are pipeline/parameter names, not secrets"
+    Properties:
+      FunctionName: !Sub '${ProjectName}-pipeline-filter-${Environment}'
+      Description: 'Routes each push to the Infra pipeline, App pipeline, both, or neither based on changed paths.'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !Ref PipelineFilterLambdaRoleArn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          INFRA_PIPELINE_NAME: !Ref WeatherDashboardPipeline
+          APP_PIPELINE_NAME: !Sub '${ProjectName}-app-pipeline-${Environment}'
+          PENDING_PARAM_NAME: !Sub '/${ProjectName}/pipeline-coordination/pending-app-release-${Environment}'
+      Code:
+        ZipFile: |
+          import logging, os
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          codecommit = boto3.client('codecommit')
+          codepipeline = boto3.client('codepipeline')
+          ssm = boto3.client('ssm')
+
+          INFRA_PIPELINE_NAME = os.environ['INFRA_PIPELINE_NAME']
+          APP_PIPELINE_NAME = os.environ['APP_PIPELINE_NAME']
+          PENDING_PARAM_NAME = os.environ['PENDING_PARAM_NAME']
+
+          INFRA_PREFIXES = ('infrastructure/cloudformation/', 'pipeline/')
+          # backend/tests/ added 2026-07-29: pipeline/buildspec/test.yml (the
+          # actual pytest runner) is wired into the app pipeline's Test stage
+          # only - confirmed via 08b-app-pipeline.yml referencing it and
+          # 08-pipeline.yml (this file) not - so a test-only change needs
+          # exactly the app pipeline, not the infra/app fail-safe below.
+          APP_PREFIXES = ('backend/lambda/', 'backend/tests/', 'frontend/', 'diagrams/interactive/', 'scripts/')
+
+          # Root-level files with no deploy-time effect on either pipeline -
+          # tracked in git like any other file, just excluded from routing.
+          # Makefile added 2026-07-29: confirmed neither pipeline's buildspecs
+          # ever invoke `make` - they call the underlying scripts
+          # (validate-templates.sh, run-tests.sh, etc.) directly, so a
+          # Makefile-only change has no possible effect on what CI executes.
+          NON_FUNCTIONAL_ROOT_FILES = ('.gitignore', '.gitattributes', 'Makefile')
+
+          def is_docs_only(path):
+              if path.startswith('docs/'):
+                  return True
+              if path.startswith('diagrams/') and path.endswith('.md') and not path.startswith('diagrams/interactive/'):
+                  return True
+              if '/' not in path and path.endswith('.md'):
+                  return True
+              if path in NON_FUNCTIONAL_ROOT_FILES:
+                  return True
+              return False
+
+          def classify_paths(paths):
+              infra, app = False, False
+              for p in paths:
+                  if is_docs_only(p):
+                      continue
+                  if p.startswith(INFRA_PREFIXES):
+                      infra = True
+                  elif p.startswith(APP_PREFIXES):
+                      app = True
+                  else:
+                      # Fail-safe: an unrecognized path might affect either
+                      # side — trigger both rather than silently
+                      # under-triggering.
+                      infra = True
+                      app = True
+              return infra, app
+
+          def get_changed_paths(repo, old_commit, new_commit):
+              paths, kwargs = [], {
+                  'repositoryName': repo,
+                  'beforeCommitSpecifier': old_commit,
+                  'afterCommitSpecifier': new_commit,
+              }
+              while True:
+                  resp = codecommit.get_differences(**kwargs)
+                  for diff in resp.get('differences', []):
+                      blob = diff.get('afterBlob') or diff.get('beforeBlob')
+                      if blob:
+                          paths.append(blob['path'])
+                  if not resp.get('nextToken'):
+                      break
+                  kwargs['nextToken'] = resp['nextToken']
+              return paths
+
+          def handler(event, context):
+              detail = event.get('detail', {})
+              repo = detail.get('repositoryName')
+              new_commit = detail.get('commitId')
+              old_commit = detail.get('oldCommitId')
+
+              if not repo or not new_commit:
+                  logger.info('Malformed event (missing repositoryName/commitId) — '
+                               'likely a git push-protocol negotiation call CodeCommit '
+                               'also reports as GitPush. Ignoring, not starting anything.')
+                  return {'status': 'ignored', 'reason': 'malformed-event'}
+
+              if not old_commit:
+                  # Don't trust this as proof of a genuinely new branch — ask the
+                  # commit itself for its parent and diff against that instead.
+                  # Only a true root commit (no parent at all) gets the
+                  # unconditional-start treatment.
+                  commit_info = codecommit.get_commit(repositoryName=repo, commitId=new_commit)['commit']
+                  parents = commit_info.get('parents', [])
+                  if not parents:
+                      logger.info('New branch push (root commit, no parent) — starting both pipelines unconditionally')
+                      codepipeline.start_pipeline_execution(name=INFRA_PIPELINE_NAME)
+                      codepipeline.start_pipeline_execution(name=APP_PIPELINE_NAME)
+                      return {'status': 'started', 'reason': 'new-branch', 'pipelines': [INFRA_PIPELINE_NAME, APP_PIPELINE_NAME]}
+                  old_commit = parents[0]
+                  logger.info('Event omitted oldCommitId — recovered %s from commit parent', old_commit)
+
+              paths = get_changed_paths(repo, old_commit, new_commit)
+              logger.info('Changed paths (%d): %s', len(paths), paths)
+
+              if not paths:
+                  logger.info('Empty diff — starting both pipelines to be safe')
+                  codepipeline.start_pipeline_execution(name=INFRA_PIPELINE_NAME)
+                  codepipeline.start_pipeline_execution(name=APP_PIPELINE_NAME)
+                  return {'status': 'started', 'reason': 'empty-diff', 'pipelines': [INFRA_PIPELINE_NAME, APP_PIPELINE_NAME]}
+
+              if all(is_docs_only(p) for p in paths):
+                  logger.info('Docs-only commit — skipping both pipelines: %s', paths)
+                  return {'status': 'skipped', 'reason': 'docs-only', 'paths': paths}
+
+              infra_changed, app_changed = classify_paths(paths)
+              logger.info('Routing decision: infra=%s app=%s paths=%s', infra_changed, app_changed, paths)
+
+              if infra_changed and app_changed:
+                  codepipeline.start_pipeline_execution(name=INFRA_PIPELINE_NAME)
+                  ssm.put_parameter(Name=PENDING_PARAM_NAME, Value=new_commit, Type='String', Overwrite=True)
+                  logger.info('Combined change — started %s, queued %s to release on success (commit %s)',
+                               INFRA_PIPELINE_NAME, APP_PIPELINE_NAME, new_commit)
+                  return {'status': 'started', 'reason': 'combined-infra-first', 'commit': new_commit}
+
+              if infra_changed:
+                  codepipeline.start_pipeline_execution(name=INFRA_PIPELINE_NAME)
+                  return {'status': 'started', 'reason': 'infra-only', 'paths': paths}
+
+              codepipeline.start_pipeline_execution(name=APP_PIPELINE_NAME)
+              return {'status': 'started', 'reason': 'app-only', 'paths': paths}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda Permission — allow EventBridge to invoke the filter function ────
+  FilterFunctionEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PipelineFilterFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PipelineTriggerRule.Arn
+
+  # ── CodePipeline (Infra) ─────────────────────────────────────────────────────
+  # Five stages: Source → Validate → ApproveDeploy → Deploy → ValidateDeployment.
+  # Renamed to *-infra-pipeline-* for clarity (2026-07-14) — user explicitly
+  # accepted the CFN replacement this causes (Name is a create-only property
+  # on AWS::CodePipeline::Pipeline). See
+  # docs/WeatherApp-PipeSplit-ImplePlan-V1.md §0.2 gap #3 for the original
+  # reasoning against this, and the follow-up note for why it was reversed.
+  # Each stage must succeed before the next starts — a single failure stops
+  # the pipeline and shows exactly which stage broke.
+  WeatherDashboardPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-infra-pipeline-${Environment}'
+      RoleArn: !Ref CodePipelineServiceRoleArn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucketName
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: CodeCommitSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !GetAtt CodeCommitRepository.Name
+                BranchName: !Ref BranchName
+                PollForSourceChanges: 'false'
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Validate
+          Actions:
+            - Name: LintSecurityCVE
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ValidateProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: ApproveDeploy
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref DeployApprovalTopic
+                CustomData: 'Review the CodeBuild "Test" stage output, then approve to deploy to production.'
+              RunOrder: 1
+
+        - Name: Deploy
+          Actions:
+            - Name: PackageAndDeploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DeployProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: DeployArtifact
+              RunOrder: 1
+
+        - !If
+          - HasSecondaryDeploy
+          - Name: DeploySecondary
+            Actions:
+              - Name: PackageAndDeploySecondary
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref DeploySecondaryProject
+                InputArtifacts:
+                  - Name: SourceArtifact
+                RunOrder: 1
+          - !Ref AWS::NoValue
+
+        - Name: ValidateDeployment
+          Actions:
+            - Name: SmokeTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ValidateDeploymentProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── EventBridge Rule — CodeCommit push → filter Lambda ────────────────────
+  # Targets the filter Lambda, not CodePipeline directly.
+  # The Lambda inspects changed paths and conditionally starts the pipeline.
+  PipelineTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-trigger-on-push-${Environment}'
+      Description: !Sub >-
+        Invokes the pipeline filter Lambda on every push to ${BranchName}.
+        The Lambda skips the pipeline for docs-only commits.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !GetAtt CodeCommitRepository.Arn
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref BranchName
+      Targets:
+        - Id: PipelineFilterTarget
+          Arn: !GetAtt PipelineFilterFunction.Arn
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  FilterFunctionArn:
+    Description: Pipeline filter Lambda ARN — inspect logs at /aws/lambda/{name} for skip/start decisions.
+    Value: !GetAtt PipelineFilterFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FilterFunctionArn'
+
+  RepositoryCloneUrlHttp:
+    Description: HTTPS clone URL — use with git-remote-codecommit.
+    Value: !GetAtt CodeCommitRepository.CloneUrlHttp
+    Export:
+      Name: !Sub '${AWS::StackName}-RepoCloneUrlHttp'
+
+  RepositoryCloneUrlSsh:
+    Description: SSH clone URL — requires SSH key uploaded to IAM user profile.
+    Value: !GetAtt CodeCommitRepository.CloneUrlSsh
+    Export:
+      Name: !Sub '${AWS::StackName}-RepoCloneUrlSsh'
+
+  PipelineName:
+    Description: CodePipeline pipeline name.
+    Value: !Ref WeatherDashboardPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineName'
+
+  ValidateProjectName:
+    Description: Validate stage CodeBuild project — for manual re-runs and log access.
+    Value: !Ref ValidateProject
+    Export:
+      Name: !Sub '${AWS::StackName}-ValidateProjectName'
+
+  DeployProjectName:
+    Description: Deploy stage CodeBuild project — for manual re-runs and log access.
+    Value: !Ref DeployProject
+    Export:
+      Name: !Sub '${AWS::StackName}-DeployProjectName'
+
+  ValidateDeploymentProjectName:
+    Description: ValidateDeployment stage CodeBuild project — for manual re-runs and log access.
+    Value: !Ref ValidateDeploymentProject
+    Export:
+      Name: !Sub '${AWS::StackName}-ValidateDeploymentProjectName'
+
+  DeployApprovalTopicArn:
+    Description: >
+      SNS topic for deploy approval requests. Subscribe your email:
+        aws sns subscribe --topic-arn <this ARN> \
+          --protocol email --notification-endpoint you@example.com
+    Value: !Ref DeployApprovalTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-DeployApprovalTopicArn'
+
+  DeploySecondaryProjectName:
+    Condition: HasSecondaryDeploy
+    Description: DeploySecondary stage CodeBuild project — for manual re-runs and log access.
+    Value: !Ref DeploySecondaryProject
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploySecondaryProjectName'
