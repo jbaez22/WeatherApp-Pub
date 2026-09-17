@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+<rect x="0" y="0" width="1200" height="630" fill="#FFFFFF"/>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#5F6B7A"/>
+  </marker>
+  <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#1A73E8"/>
+  </marker>
+  <marker id="arrow-blue-start" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M10,0 L0,5 L10,10 z" fill="#1A73E8"/>
+  </marker>
+</defs>
+<text x="600" y="30" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="22" font-weight="700" fill="#16191F">WeatherApp &#8212; Current Architecture (Single Region)</text>
+<text x="600" y="50" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="13" font-weight="400" fill="#5F6B7A">weather.craftingnewtech.com &#8212; all services in us-east-1</text>
+<rect x="50" y="95" width="900" height="475" rx="12" fill="#FFFFFF" stroke="#FF9900" stroke-width="2"/>
+<text x="70" y="119" font-family="Helvetica Neue, Arial, sans-serif" font-size="13.5" font-weight="700" fill="#B35C00">AWS Cloud &#8212; us-east-1  (single region)</text>
+<rect x="495" y="60" width="160" height="40" rx="8" fill="#16191F" stroke="#16191F" stroke-width="1.5"/>
+<text x="575.0" y="84.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="13" font-weight="600" fill="#FFFFFF">User (Browser / Mobile)</text>
+<line x1="575" y1="100" x2="575" y2="148" stroke="#5F6B7A" stroke-width="1.75" marker-end="url(#arrow)"/>
+<rect x="485" y="148" width="180" height="54" rx="8" fill="#FFFFFF" stroke="#232F3E" stroke-width="1.5"/>
+<text x="575.0" y="171.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#16191F">CloudFront</text>
+<text x="575.0" y="187.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="11" font-weight="400" fill="#5F6B7A">CDN &#183; HTTPS &#183; OAC</text>
+<rect x="380" y="250" width="170" height="54" rx="8" fill="#FFFFFF" stroke="#232F3E" stroke-width="1.5"/>
+<text x="465.0" y="273.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#16191F">API Gateway</text>
+<text x="465.0" y="289.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="11" font-weight="400" fill="#5F6B7A">HTTP API v2</text>
+<rect x="600" y="250" width="170" height="54" rx="8" fill="#FFFFFF" stroke="#232F3E" stroke-width="1.5"/>
+<text x="685.0" y="273.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#16191F">S3 Bucket</text>
+<text x="685.0" y="289.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="11" font-weight="400" fill="#5F6B7A">Frontend (static site)</text>
+<line x1="560" y1="202" x2="465" y2="250" stroke="#5F6B7A" stroke-width="1.75" marker-end="url(#arrow)"/>
+<line x1="590" y1="202" x2="685" y2="250" stroke="#5F6B7A" stroke-width="1.75" marker-end="url(#arrow)"/>
+<rect x="325" y="350" width="280" height="100" rx="8" fill="#FFFFFF" stroke="#232F3E" stroke-width="1.5"/>
+<text x="465.0" y="380.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#16191F">Lambda alias "live"</text>
+<text x="465.0" y="396.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="11" font-weight="400" fill="#5F6B7A">Provisioned Concurrency: 1</text>
+<text x="465.0" y="412.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="11" font-weight="400" fill="#5F6B7A">X-Ray tracing: active</text>
+<text x="465.0" y="428.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="11" font-weight="400" fill="#5F6B7A">CodeDeploy: canary 10% / 5 min</text>
+<line x1="465" y1="304" x2="465" y2="350" stroke="#5F6B7A" stroke-width="1.75" marker-end="url(#arrow)"/>
+<rect x="90" y="490" width="170" height="54" rx="8" fill="#FFFFFF" stroke="#232F3E" stroke-width="1.5"/>
+<text x="175.0" y="513.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#16191F">DynamoDB</text>
+<text x="175.0" y="529.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="11" font-weight="400" fill="#5F6B7A">WeatherCache</text>
+<rect x="380" y="490" width="190" height="54" rx="8" fill="#FFFFFF" stroke="#232F3E" stroke-width="1.5"/>
+<text x="475.0" y="513.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#16191F">Secrets Manager</text>
+<text x="475.0" y="529.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="11" font-weight="400" fill="#5F6B7A">OWM API Key</text>
+<rect x="690" y="490" width="170" height="54" rx="8" fill="#FFFFFF" stroke="#232F3E" stroke-width="1.5"/>
+<text x="775.0" y="513.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#16191F">CloudWatch</text>
+<text x="775.0" y="529.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="11" font-weight="400" fill="#5F6B7A">Logs + Alarms</text>
+<line x1="400" y1="450" x2="175" y2="490" stroke="#5F6B7A" stroke-width="1.75" marker-end="url(#arrow)"/>
+<line x1="465" y1="450" x2="475" y2="490" stroke="#5F6B7A" stroke-width="1.75" marker-end="url(#arrow)"/>
+<line x1="530" y1="450" x2="775" y2="490" stroke="#5F6B7A" stroke-width="1.75" marker-end="url(#arrow)"/>
+<rect x="985" y="375" width="195" height="70" rx="8" fill="#FFFFFF" stroke="#5F6B7A" stroke-width="1.5" stroke-dasharray="5,3"/>
+<text x="1082.5" y="398.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#16191F">OpenWeatherMap</text>
+<text x="1082.5" y="414.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="11" font-weight="400" fill="#5F6B7A">External API</text>
+<text x="1082.5" y="430.0" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="11" font-weight="400" fill="#5F6B7A">(on cache miss)</text>
+<line x1="605" y1="400" x2="985" y2="405" stroke="#5F6B7A" stroke-width="1.75" marker-end="url(#arrow)"/>
+<text x="600" y="600" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="14" font-weight="700" fill="#D93025">&#9888; Single point of failure &#8212; a us-east-1 outage takes the entire app offline.</text>
+</svg>

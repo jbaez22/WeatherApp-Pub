@@ -47,6 +47,5 @@ security-scan-report-*.md
 .codex/
 
 # PENDING REVIEW — restored from private repo, sanitized (account ID -> placeholder),
-# but not yet reviewed/approved for public commit. Remove these lines once reviewed.
-docs/
+# but not yet reviewed/approved for public commit. Remove this line once reviewed.
 diagrams/
