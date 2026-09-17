@@ -20,6 +20,8 @@ User → Route 53 Failover (api.weather.craftingnewtech.com)
      → OpenWeatherMap API (One Call 3.0)
 ```
 
+![Multi-Region Architecture](docs/WAPMultiRegion/weatherapp-multi-region-architecture.svg)
+
 All infrastructure is defined in CloudFormation. All deployments run through two independent CodePipelines (Infra + App — see `docs/WeatherApp-PipeSplit-ImplePlan-V1.md`). No manual steps after initial bootstrap. Automatic active-passive regional failover is documented in `docs/WAPMultiRegion/`.
 
 ---
