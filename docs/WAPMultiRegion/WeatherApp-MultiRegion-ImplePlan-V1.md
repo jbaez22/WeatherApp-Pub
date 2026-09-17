@@ -89,7 +89,7 @@ gap this plan's own §2.1 hadn't called out. Fixed by adding a
 `BucketNameSuffix` parameter (default `''`, preserving the exact existing
 primary bucket name unchanged) and appending it to `BucketName`; the
 us-west-2 deploy passed `BucketNameSuffix=-us-west-2`, producing
-`weather-dashboard-artifacts-123456789012-production-us-west-2`. Confirmed
+`weather-dashboard-artifacts-ABC-EXAMPLE-XXXX-production-us-west-2`. Confirmed
 the primary bootstrap stack/bucket were untouched
 (`describe-stacks` still shows `UPDATE_COMPLETE` and the unsuffixed name)
 before proceeding — this parameter was purely additive, never redeployed
@@ -246,7 +246,7 @@ ALIAS target, not something a client can curl directly. API Gateway custom
 domains route by `Host` header/SNI; a health checker connecting straight to
 the raw regional name sends that name as the `Host` header, which matches no
 `ApiMapping`, hence 404 — confirmed by curling
-`https://d-exampleid1.execute-api.us-east-1.amazonaws.com/health` directly
+`https://d-ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/health` directly
 and reproducing the exact same 404. Fixed by adding a second parameter,
 `PrimaryHealthCheckDomainName`, pointing the health check at the *raw*
 `execute-api` hostname (from the existing `ApiEndpoint` output, scheme
@@ -288,8 +288,8 @@ final `ValidateDeployment` smoke test briefly lagged CodePipeline's own
 status update after the underlying CodeBuild job had already finished (not
 a real hang). Full regression check across everything built so far, all
 green:
-- `https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/health` → 200, `us-east-1`
-- `https://f6g7h8i9j0.execute-api.us-west-2.amazonaws.com/health` → 200, `us-west-2`
+- `https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/health` → 200, `us-east-1`
+- `https://ABC-EXAMPLE-XXXX.execute-api.us-west-2.amazonaws.com/health` → 200, `us-west-2`
 - `https://api.weather.craftingnewtech.com/health` → 200, `us-east-1` (correctly routing to the healthy primary)
 - `https://weather.craftingnewtech.com/js/config.js` → confirmed the **live production frontend** now serves the updated `API_BASE_URL` pointing at the failover domain — task 3.3 is genuinely live, not just committed.
 
@@ -448,7 +448,7 @@ to silently not work during the exact disaster scenario it's meant to survive.
 
 1. **CloudFront never sees API traffic today — there is no Origin Group to add.**
    `frontend/js/config.js` hardcodes
-   `API_BASE_URL: 'https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com'` — the
+   `API_BASE_URL: 'https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com'` — the
    browser calls API Gateway directly. `03-cdn.yml`'s CloudFront distribution has
    exactly one origin (`S3WebsiteOrigin`, the frontend bucket). The proposal's
    target diagram assumed CloudFront already proxies `/weather` and `/locate` and
@@ -899,7 +899,7 @@ aws cloudformation deploy \
   --parameter-overrides \
     ArtifactsBucketName="$WEST_ARTIFACTS_BUCKET" \
     LambdaZipKey=lambda/lambda.zip \
-    HostedZoneId=ZEXAMPLE0000000000 \
+    HostedZoneId=ABC-EXAMPLE-XXXX \
   --no-execute-changeset
 
 # Review the change set, then execute for real:
@@ -911,7 +911,7 @@ aws cloudformation deploy \
   --parameter-overrides \
     ArtifactsBucketName="$WEST_ARTIFACTS_BUCKET" \
     LambdaZipKey=lambda/lambda.zip \
-    HostedZoneId=ZEXAMPLE0000000000
+    HostedZoneId=ABC-EXAMPLE-XXXX
 ```
 
 ### 2.4 Native Secrets Manager replication
@@ -1037,12 +1037,12 @@ aws cloudformation validate-template --template-body file://infrastructure/cloud
 ### 2.8 Verify both regions
 
 ```bash
-curl -s https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/health | jq .
+curl -s https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/health | jq .
 WEST_API=$(aws cloudformation describe-stacks --region us-west-2 \
   --stack-name weather-dashboard-secondary-production \
   --query 'Stacks[0].Outputs[?OutputKey==`HealthEndpoint`].OutputValue' --output text)
 curl -s "$WEST_API" | jq .
-curl -s "https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/weather?city=London" | jq '.city'
+curl -s "https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/weather?city=London" | jq '.city'
 ```
 
 ---
@@ -1146,7 +1146,7 @@ aws cloudformation deploy \
   --template-file infrastructure/cloudformation/12-failover-dns.yml \
   --stack-name weather-dashboard-failover-dns-production \
   --parameter-overrides \
-    HostedZoneId=ZEXAMPLE0000000000 \
+    HostedZoneId=ABC-EXAMPLE-XXXX \
     PrimaryDomainName="$PRIMARY_DOMAIN" PrimaryHostedZoneId="$PRIMARY_ZONE" \
     SecondaryDomainName="$SECONDARY_DOMAIN" SecondaryHostedZoneId="$SECONDARY_ZONE"
 ```
@@ -1156,7 +1156,7 @@ aws cloudformation deploy \
 `frontend/js/config.js`:
 
 ```diff
--  API_BASE_URL: 'https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com',
+-  API_BASE_URL: 'https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com',
 +  API_BASE_URL: 'https://api.weather.craftingnewtech.com',
 ```
 
@@ -1201,7 +1201,7 @@ with no manual intervention.
 ### 4.3 Replication check
 
 ```bash
-curl -s "https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/weather?city=ReplicationTestCity"
+curl -s "https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/weather?city=ReplicationTestCity"
 sleep 3
 aws dynamodb get-item --region us-west-2 --table-name WeatherCache \
   --key '{"city": {"S": "replicationtestcity"}}'

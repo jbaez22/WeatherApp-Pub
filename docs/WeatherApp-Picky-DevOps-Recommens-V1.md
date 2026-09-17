@@ -42,7 +42,7 @@ evidence, the most likely reason it happened, and concrete steps to fix it.
 
 ```bash
 aws sns list-subscriptions-by-topic \
-  --topic-arn arn:aws:sns:us-east-1:123456789012:weather-dashboard-alarms-production
+  --topic-arn arn:aws:sns:us-east-1:ABC-EXAMPLE-XXXX:weather-dashboard-alarms-production
 # → empty
 ```
 
@@ -73,7 +73,7 @@ so the one-line manual bootstrap step in the comment was never actually run.
 1. Subscribe immediately (unblocks live alerting today):
    ```bash
    aws sns subscribe \
-     --topic-arn arn:aws:sns:us-east-1:123456789012:weather-dashboard-alarms-production \
+     --topic-arn arn:aws:sns:us-east-1:ABC-EXAMPLE-XXXX:weather-dashboard-alarms-production \
      --protocol email --notification-endpoint you@example.com
    ```
 2. Confirm the subscription via the email SNS sends (subscriptions sit

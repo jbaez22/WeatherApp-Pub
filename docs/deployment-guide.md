@@ -39,8 +39,8 @@ Expected output:
 ```json
 {
     "UserId": "AIDAXXXXXXXXXXXXXXXXX",
-    "Account": "123456789012",
-    "Arn": "arn:aws:iam::123456789012:user/your-admin-user"
+    "Account": "ABC-EXAMPLE-XXXX",
+    "Arn": "arn:aws:iam::ABC-EXAMPLE-XXXX:user/your-admin-user"
 }
 ```
 

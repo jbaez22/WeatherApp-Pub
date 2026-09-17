@@ -108,7 +108,7 @@ For explicit cost monitoring, enable AWS Cost Explorer and set a billing alert a
 
 ```bash
 aws budgets create-budget \
-  --account-id 123456789012 \
+  --account-id ABC-EXAMPLE-XXXX \
   --budget '{
     "BudgetName": "weather-dashboard-monthly",
     "BudgetLimit": {"Amount": "5", "Unit": "USD"},

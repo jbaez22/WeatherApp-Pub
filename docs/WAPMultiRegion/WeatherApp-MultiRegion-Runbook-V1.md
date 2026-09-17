@@ -22,11 +22,11 @@ full sequence.
 | -------------------------------- | ---------------------------------------------------------------- |
 | Item                             | Value                                                            |
 | -------------------------------- | ---------------------------------------------------------------- |
-| AWS Account ID                   | `123456789012`                                                   |
+| AWS Account ID                   | `ABC-EXAMPLE-XXXX`                                                   |
 | Primary region                   | `us-east-1`                                                      |
 | Secondary (failover) region      | `us-west-2`                                                      |
-| Primary API endpoint             | `https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com`         |
-| Secondary API endpoint           | `https://f6g7h8i9j0.execute-api.us-west-2.amazonaws.com`         |
+| Primary API endpoint             | `https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com`         |
+| Secondary API endpoint           | `https://ABC-EXAMPLE-XXXX.execute-api.us-west-2.amazonaws.com`         |
 | Future failover domain (Phase 3) | `api.weather.craftingnewtech.com`                                |
 | Primary master stack             | `weather-dashboard-master-production` (us-east-1)                |
 | Secondary stack                  | `weather-dashboard-secondary-production` (us-west-2)             |
@@ -48,12 +48,12 @@ are the main global/console-wide exceptions.
 
 ```bash
 # Primary region
-curl -s -w '\nHTTP %{http_code}\n' https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/health
-curl -s -w '\nHTTP %{http_code}\n' 'https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/weather?city=Austin'
+curl -s -w '\nHTTP %{http_code}\n' https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/health
+curl -s -w '\nHTTP %{http_code}\n' 'https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/weather?city=Austin'
 
 # Secondary region
-curl -s -w '\nHTTP %{http_code}\n' https://f6g7h8i9j0.execute-api.us-west-2.amazonaws.com/health
-curl -s -w '\nHTTP %{http_code}\n' 'https://f6g7h8i9j0.execute-api.us-west-2.amazonaws.com/weather?city=Austin'
+curl -s -w '\nHTTP %{http_code}\n' https://ABC-EXAMPLE-XXXX.execute-api.us-west-2.amazonaws.com/health
+curl -s -w '\nHTTP %{http_code}\n' 'https://ABC-EXAMPLE-XXXX.execute-api.us-west-2.amazonaws.com/weather?city=Austin'
 ```
 Expect `{"status": "ok", "region": "us-east-1"}` / `"us-west-2"` respectively,
 both HTTP 200. The `region` field in the response is the definitive signal of
@@ -190,7 +190,7 @@ dig api.weather.craftingnewtech.com +noall +answer
 # selects the record and still correctly reports null (real answer); the
 # chained-bracket form returns null from selecting nothing at all (false
 # answer that happens to look the same).
-aws route53 list-resource-record-sets --hosted-zone-id ZEXAMPLE0000000000 \
+aws route53 list-resource-record-sets --hosted-zone-id ABC-EXAMPLE-XXXX \
   --query "ResourceRecordSets[?Name == 'api.weather.craftingnewtech.com.' && Type == 'A']|[0].TTL"
 ```
 Expect `60` as the TTL value (second column) on every `dig` answer line, and
@@ -245,9 +245,9 @@ aws route53 update-health-check --health-check-id "$HEALTH_CHECK_ID" \
   --resource-path /health-drill-test
 
 # Confirm real traffic is completely unaffected - only the drill path 404s
-curl -s -w '\nHTTP %{http_code}\n' https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/health
-curl -s -w '\nHTTP %{http_code}\n' 'https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/weather?city=Austin'
-curl -s -w '\nHTTP %{http_code}\n' https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/health-drill-test
+curl -s -w '\nHTTP %{http_code}\n' https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/health
+curl -s -w '\nHTTP %{http_code}\n' 'https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/weather?city=Austin'
+curl -s -w '\nHTTP %{http_code}\n' https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/health-drill-test
 ```
 Expect the first two calls to still return 200 with real data; only the
 drill path returns 404.
@@ -319,8 +319,8 @@ echo "Alarm state: $STATE"
 ### Step 7 — Final full regression check
 
 ```bash
-curl -s -w '\nHTTP %{http_code}\n' https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/health
-curl -s -w '\nHTTP %{http_code}\n' https://f6g7h8i9j0.execute-api.us-west-2.amazonaws.com/health
+curl -s -w '\nHTTP %{http_code}\n' https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/health
+curl -s -w '\nHTTP %{http_code}\n' https://ABC-EXAMPLE-XXXX.execute-api.us-west-2.amazonaws.com/health
 curl -s -w '\nHTTP %{http_code}\n' https://api.weather.craftingnewtech.com/health
 curl -s -w '\nHTTP %{http_code}\n' 'https://api.weather.craftingnewtech.com/weather?city=Austin'
 ```

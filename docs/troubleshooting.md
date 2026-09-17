@@ -295,7 +295,7 @@ aws cloudformation wait stack-delete-complete --stack-name weather-dashboard-mas
 #    These are safe to delete when they hold only placeholder / empty content.
 
 # WebsiteBucket (S3)
-aws s3 rb s3://weather-dashboard-website-123456789012-production --force 2>&1 || echo "Not found"
+aws s3 rb s3://weather-dashboard-website-ABC-EXAMPLE-XXXX-production --force 2>&1 || echo "Not found"
 
 # Lambda log group (CloudWatch)
 aws logs delete-log-group \
@@ -320,7 +320,7 @@ aws secretsmanager delete-secret \
   --region us-east-1 2>&1 || echo "Not found"
 
 # 3. Verify the artifacts bucket and Lambda ZIP are still intact
-aws s3 ls "s3://weather-dashboard-artifacts-123456789012-production/lambda/lambda.zip" \
+aws s3 ls "s3://weather-dashboard-artifacts-ABC-EXAMPLE-XXXX-production/lambda/lambda.zip" \
   && echo "ZIP ready — proceed with re-deploy."
 
 # 4. Re-run the bootstrap deploy from docs/deployment-guide.md Step 7
@@ -337,7 +337,7 @@ aws s3 ls "s3://weather-dashboard-artifacts-123456789012-production/lambda/lambd
 ```
 Invalid request provided: AWS::CloudFront::Distribution:
 The S3 bucket that you specified for CloudFront logs does not enable ACL access:
-weather-dashboard-website-123456789012-production.s3.amazonaws.com
+weather-dashboard-website-ABC-EXAMPLE-XXXX-production.s3.amazonaws.com
 (Service: CloudFront, Status Code: 400)
 ```
 

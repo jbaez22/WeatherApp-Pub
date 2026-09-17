@@ -68,7 +68,7 @@ allowed set. Prefer simple prose with no special characters in SSM tag values.
 ### Symptom
 ```
 Resource of type 'AWS::S3::Bucket' with identifier
-'weather-dashboard-artifacts-123456789012-production' already exists.
+'weather-dashboard-artifacts-ABC-EXAMPLE-XXXX-production' already exists.
 ```
 
 ### Root Cause
@@ -142,7 +142,7 @@ common for pipeline artifact buckets in production AWS deployments.
 ```
 Invalid request provided: AWS::CloudFront::Distribution:
 The S3 bucket that you specified for CloudFront logs does not enable ACL access:
-weather-dashboard-website-123456789012-production.s3.amazonaws.com
+weather-dashboard-website-ABC-EXAMPLE-XXXX-production.s3.amazonaws.com
 (Service: CloudFront, Status Code: 400)
 ```
 
@@ -186,7 +186,7 @@ deploy attempt (they would have caused "already exists" conflicts):
 
 | Resource | Name | Action Taken |
 |---|---|---|
-| `WebsiteBucket` (S3) | `weather-dashboard-website-123456789012-production` | Deleted (empty) |
+| `WebsiteBucket` (S3) | `weather-dashboard-website-ABC-EXAMPLE-XXXX-production` | Deleted (empty) |
 | `LambdaLogGroup` (CloudWatch) | `/aws/lambda/weather-dashboard-handler-production` | Deleted (empty) |
 | `ApiAccessLogGroup` (CloudWatch) | `/aws/apigateway/weather-dashboard-production` | Deleted (empty) |
 | `OpenWeatherMapApiKey` (SSM) | `/weather-dashboard/openweathermap-api-key` | Deleted (placeholder value) |
@@ -345,5 +345,5 @@ weather-dashboard-master-production → CREATE_COMPLETE
 |---|---|
 | Website | `https://weather.craftingnewtech.com` |
 | CloudFront domain | `d2cbs1x5b0oe7p.cloudfront.net` |
-| API Gateway | `https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com` |
+| API Gateway | `https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com` |
 | CodeCommit | `https://git-codecommit.us-east-1.amazonaws.com/v1/repos/weather-dashboard` |

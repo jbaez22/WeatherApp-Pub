@@ -35,7 +35,7 @@ Parameters:
     Type: String
     Description: >
       Primary region's RAW execute-api hostname (no scheme) - e.g.
-      a1b2c3d4e5.execute-api.us-east-1.amazonaws.com, from
+      ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com, from
       weather-dashboard-master-production's ApiEndpoint output with the
       https:// prefix stripped. This is what the health check actually
       polls - it isn't gated by custom-domain Host-header matching, and its

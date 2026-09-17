@@ -363,9 +363,9 @@ aws codepipeline put-approval-result \
 Subscribe once per topic if you haven't already (each pipeline has its
 own — subscribing to one does not cover the other):
 ```bash
-aws sns subscribe --topic-arn arn:aws:sns:us-east-1:123456789012:weather-dashboard-deploy-approval-production \
+aws sns subscribe --topic-arn arn:aws:sns:us-east-1:ABC-EXAMPLE-XXXX:weather-dashboard-deploy-approval-production \
   --protocol email --notification-endpoint you@example.com
-aws sns subscribe --topic-arn arn:aws:sns:us-east-1:123456789012:weather-dashboard-app-deploy-approval-production \
+aws sns subscribe --topic-arn arn:aws:sns:us-east-1:ABC-EXAMPLE-XXXX:weather-dashboard-app-deploy-approval-production \
   --protocol email --notification-endpoint you@example.com
 ```
 
@@ -651,7 +651,7 @@ aws cloudwatch get-metric-data --start-time $(date -u -v-30d +%Y-%m-%dT%H:%M:%S)
 ```
 
 `scripts/slo-query.json` hardcodes the current API Gateway `ApiId`
-(`a1b2c3d4e5`) as a dimension value — if the API Gateway is ever recreated
+(`ABC-EXAMPLE-XXXX`) as a dimension value — if the API Gateway is ever recreated
 (new `ApiId`), update that file to match before trusting this query's
 output. Confirm the current ID: `aws cloudformation describe-stacks
 --stack-name weather-dashboard-master-production --query
@@ -889,7 +889,7 @@ be investigated fully before dismissing.
   ```bash
   for topic in deploy-approval key-rotation security-findings; do
     aws sns list-subscriptions-by-topic \
-      --topic-arn "arn:aws:sns:us-east-1:123456789012:weather-dashboard-$topic-production" \
+      --topic-arn "arn:aws:sns:us-east-1:ABC-EXAMPLE-XXXX:weather-dashboard-$topic-production" \
       --query 'Subscriptions[].{Endpoint:Endpoint,Status:SubscriptionArn}' --output table
   done
   ```
@@ -911,12 +911,12 @@ be investigated fully before dismissing.
   resource, dry-run it against production first:
   ```bash
   aws cloudformation package --template-file infrastructure/cloudformation/master.yml \
-    --s3-bucket weather-dashboard-artifacts-123456789012-production --s3-prefix cloudformation \
+    --s3-bucket weather-dashboard-artifacts-ABC-EXAMPLE-XXXX-production --s3-prefix cloudformation \
     --output-template-file infrastructure/cloudformation/master-packaged.yml
   aws cloudformation deploy --template-file infrastructure/cloudformation/master-packaged.yml \
     --stack-name weather-dashboard-master-production \
     --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
-    --role-arn arn:aws:iam::123456789012:role/weather-dashboard-cfn-deploy-role-production \
+    --role-arn arn:aws:iam::ABC-EXAMPLE-XXXX:role/weather-dashboard-cfn-deploy-role-production \
     --no-execute-changeset
   # Inspect with describe-change-set --include-property-values, then
   # aws cloudformation delete-change-set when done — never leave a stale
@@ -973,7 +973,7 @@ forms live: the query below actually selects the record and still correctly
 reports `null`; the chained-bracket form reports `null` from selecting
 nothing at all.
 ```bash
-aws route53 list-resource-record-sets --hosted-zone-id ZEXAMPLE0000000000 \
+aws route53 list-resource-record-sets --hosted-zone-id ABC-EXAMPLE-XXXX \
   --query "ResourceRecordSets[?Name == 'api.weather.craftingnewtech.com.' && Type == 'A']|[0].TTL"
 ```
 Expect output like:
@@ -1006,8 +1006,8 @@ aws route53 get-health-check-status --health-check-id <id> \
 
 # Is the primary region's API actually unreachable, or just the health
 # check's specific /health route?
-curl -s -w '\nHTTP %{http_code}\n' https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/health
-curl -s -w '\nHTTP %{http_code}\n' 'https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/weather?city=Austin'
+curl -s -w '\nHTTP %{http_code}\n' https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/health
+curl -s -w '\nHTTP %{http_code}\n' 'https://ABC-EXAMPLE-XXXX.execute-api.us-east-1.amazonaws.com/weather?city=Austin'
 
 # AWS-side status — check for an actual announced regional event before
 # assuming it's your own application
@@ -1047,7 +1047,7 @@ cd WeatherAPP
 Confirm us-west-2 is actually healthy and already serving (failover should
 already be automatic — this just confirms it):
 ```bash
-curl -s -w '\nHTTP %{http_code}\n' https://f6g7h8i9j0.execute-api.us-west-2.amazonaws.com/health
+curl -s -w '\nHTTP %{http_code}\n' https://ABC-EXAMPLE-XXXX.execute-api.us-west-2.amazonaws.com/health
 curl -s -w '\nHTTP %{http_code}\n' https://api.weather.craftingnewtech.com/health
 ```
 
@@ -1060,7 +1060,7 @@ recoverable once us-east-1 returns):
 ```bash
 aws cloudformation package --region us-west-2 \
   --template-file infrastructure/cloudformation/master-secondary.yml \
-  --s3-bucket weather-dashboard-artifacts-123456789012-production-us-west-2 \
+  --s3-bucket weather-dashboard-artifacts-ABC-EXAMPLE-XXXX-production-us-west-2 \
   --s3-prefix cloudformation \
   --output-template-file infrastructure/cloudformation/master-secondary-packaged.yml
 
@@ -1075,11 +1075,11 @@ To update just the Lambda code in us-west-2 without a full stack deploy
 (e.g. a hotfix that can't wait for us-east-1 to recover):
 ```bash
 aws s3 cp backend-lambda.zip \
-  s3://weather-dashboard-artifacts-123456789012-production-us-west-2/lambda/lambda.zip \
+  s3://weather-dashboard-artifacts-ABC-EXAMPLE-XXXX-production-us-west-2/lambda/lambda.zip \
   --region us-west-2
 aws lambda update-function-code --region us-west-2 \
   --function-name weather-dashboard-handler-production \
-  --s3-bucket weather-dashboard-artifacts-123456789012-production-us-west-2 \
+  --s3-bucket weather-dashboard-artifacts-ABC-EXAMPLE-XXXX-production-us-west-2 \
   --s3-key lambda/lambda.zip --publish
 ```
 

@@ -12,7 +12,7 @@
         "Namespace": "AWS/ApiGateway",
         "MetricName": "5XXError",
         "Dimensions": [
-          { "Name": "ApiId", "Value": "a1b2c3d4e5" }
+          { "Name": "ApiId", "Value": "ABC-EXAMPLE-XXXX" }
         ]
       },
       "Period": 2592000,
@@ -27,7 +27,7 @@
         "Namespace": "AWS/ApiGateway",
         "MetricName": "4XXError",
         "Dimensions": [
-          { "Name": "ApiId", "Value": "a1b2c3d4e5" }
+          { "Name": "ApiId", "Value": "ABC-EXAMPLE-XXXX" }
         ]
       },
       "Period": 2592000,
@@ -42,7 +42,7 @@
         "Namespace": "AWS/ApiGateway",
         "MetricName": "Count",
         "Dimensions": [
-          { "Name": "ApiId", "Value": "a1b2c3d4e5" }
+          { "Name": "ApiId", "Value": "ABC-EXAMPLE-XXXX" }
         ]
       },
       "Period": 2592000,
