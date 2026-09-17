@@ -408,7 +408,7 @@ aws route53 get-health-check-status --health-check-id <id> \
 
 # Reproduce directly
 curl -sS -o /dev/null -w "%{http_code}\n" \
-  "https://d-zf3io5p23g.execute-api.us-east-1.amazonaws.com/health"
+  "https://d-exampleid1.execute-api.us-east-1.amazonaws.com/health"
 ```
 
 **Fix:** Added a second parameter, `PrimaryHealthCheckDomainName`, pointing

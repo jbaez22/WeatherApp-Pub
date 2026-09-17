@@ -345,5 +345,5 @@ weather-dashboard-master-production → CREATE_COMPLETE
 |---|---|
 | Website | `https://weather.craftingnewtech.com` |
 | CloudFront domain | `d2cbs1x5b0oe7p.cloudfront.net` |
-| API Gateway | `https://876mh0k6q1.execute-api.us-east-1.amazonaws.com` |
+| API Gateway | `https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com` |
 | CodeCommit | `https://git-codecommit.us-east-1.amazonaws.com/v1/repos/weather-dashboard` |

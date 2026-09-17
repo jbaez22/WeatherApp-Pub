@@ -651,7 +651,7 @@ aws cloudwatch get-metric-data --start-time $(date -u -v-30d +%Y-%m-%dT%H:%M:%S)
 ```
 
 `scripts/slo-query.json` hardcodes the current API Gateway `ApiId`
-(`876mh0k6q1`) as a dimension value — if the API Gateway is ever recreated
+(`a1b2c3d4e5`) as a dimension value — if the API Gateway is ever recreated
 (new `ApiId`), update that file to match before trusting this query's
 output. Confirm the current ID: `aws cloudformation describe-stacks
 --stack-name weather-dashboard-master-production --query
@@ -1006,8 +1006,8 @@ aws route53 get-health-check-status --health-check-id <id> \
 
 # Is the primary region's API actually unreachable, or just the health
 # check's specific /health route?
-curl -s -w '\nHTTP %{http_code}\n' https://876mh0k6q1.execute-api.us-east-1.amazonaws.com/health
-curl -s -w '\nHTTP %{http_code}\n' 'https://876mh0k6q1.execute-api.us-east-1.amazonaws.com/weather?city=Austin'
+curl -s -w '\nHTTP %{http_code}\n' https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/health
+curl -s -w '\nHTTP %{http_code}\n' 'https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/weather?city=Austin'
 
 # AWS-side status — check for an actual announced regional event before
 # assuming it's your own application
@@ -1047,7 +1047,7 @@ cd WeatherAPP
 Confirm us-west-2 is actually healthy and already serving (failover should
 already be automatic — this just confirms it):
 ```bash
-curl -s -w '\nHTTP %{http_code}\n' https://ag7upj7vr0.execute-api.us-west-2.amazonaws.com/health
+curl -s -w '\nHTTP %{http_code}\n' https://f6g7h8i9j0.execute-api.us-west-2.amazonaws.com/health
 curl -s -w '\nHTTP %{http_code}\n' https://api.weather.craftingnewtech.com/health
 ```
 
