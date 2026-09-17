@@ -973,13 +973,13 @@ forms live: the query below actually selects the record and still correctly
 reports `null`; the chained-bracket form reports `null` from selecting
 nothing at all.
 ```bash
-aws route53 list-resource-record-sets --hosted-zone-id Z0659652304JBLJ48Q2DP \
+aws route53 list-resource-record-sets --hosted-zone-id ZEXAMPLE0000000000 \
   --query "ResourceRecordSets[?Name == 'api.weather.craftingnewtech.com.' && Type == 'A']|[0].TTL"
 ```
 Expect output like:
 ```
-api.weather.craftingnewtech.com. 60 IN A 54.83.105.107
-api.weather.craftingnewtech.com. 60 IN A 34.199.98.25
+api.weather.craftingnewtech.com. 60 IN A 203.0.113.10
+api.weather.craftingnewtech.com. 60 IN A 203.0.113.20
 ```
 The `60` immediately after the domain name on each line is the TTL in
 seconds. If this ever shows something other than 60, the alias target

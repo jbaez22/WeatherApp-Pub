@@ -604,7 +604,7 @@ echo "Alarm Topic ARN: $ALARM_TOPIC_ARN"
 aws sns subscribe \
   --topic-arn "$ALARM_TOPIC_ARN" \
   --protocol email \
-  --notification-endpoint "joseph.baezb@gmail.com" \
+  --notification-endpoint "you@example.com" \
   --region us-east-1
 echo "Check your inbox for the SNS confirmation email and click Confirm."
 ```

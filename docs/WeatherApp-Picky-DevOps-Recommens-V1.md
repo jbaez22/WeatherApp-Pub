@@ -47,7 +47,7 @@ aws sns list-subscriptions-by-topic \
 ```
 
 Every other project SNS topic (`app-deploy-approval`, `deploy-approval`,
-`key-rotation`, `security-findings`) has `joseph.baezb@gmail.com` confirmed
+`key-rotation`, `security-findings`) has `you@example.com` confirmed
 as a subscriber. Only the alarm topic was skipped.
 
 **Why it happened:** `09-monitoring.yml` itself documents this as a manual
@@ -74,7 +74,7 @@ so the one-line manual bootstrap step in the comment was never actually run.
    ```bash
    aws sns subscribe \
      --topic-arn arn:aws:sns:us-east-1:123456789012:weather-dashboard-alarms-production \
-     --protocol email --notification-endpoint joseph.baezb@gmail.com
+     --protocol email --notification-endpoint you@example.com
    ```
 2. Confirm the subscription via the email SNS sends (subscriptions sit
    `PendingConfirmation` until clicked — verify with

@@ -899,7 +899,7 @@ aws cloudformation deploy \
   --parameter-overrides \
     ArtifactsBucketName="$WEST_ARTIFACTS_BUCKET" \
     LambdaZipKey=lambda/lambda.zip \
-    HostedZoneId=Z0659652304JBLJ48Q2DP \
+    HostedZoneId=ZEXAMPLE0000000000 \
   --no-execute-changeset
 
 # Review the change set, then execute for real:
@@ -911,7 +911,7 @@ aws cloudformation deploy \
   --parameter-overrides \
     ArtifactsBucketName="$WEST_ARTIFACTS_BUCKET" \
     LambdaZipKey=lambda/lambda.zip \
-    HostedZoneId=Z0659652304JBLJ48Q2DP
+    HostedZoneId=ZEXAMPLE0000000000
 ```
 
 ### 2.4 Native Secrets Manager replication
@@ -1146,7 +1146,7 @@ aws cloudformation deploy \
   --template-file infrastructure/cloudformation/12-failover-dns.yml \
   --stack-name weather-dashboard-failover-dns-production \
   --parameter-overrides \
-    HostedZoneId=Z0659652304JBLJ48Q2DP \
+    HostedZoneId=ZEXAMPLE0000000000 \
     PrimaryDomainName="$PRIMARY_DOMAIN" PrimaryHostedZoneId="$PRIMARY_ZONE" \
     SecondaryDomainName="$SECONDARY_DOMAIN" SecondaryHostedZoneId="$SECONDARY_ZONE"
 ```

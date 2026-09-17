@@ -190,7 +190,7 @@ dig api.weather.craftingnewtech.com +noall +answer
 # selects the record and still correctly reports null (real answer); the
 # chained-bracket form returns null from selecting nothing at all (false
 # answer that happens to look the same).
-aws route53 list-resource-record-sets --hosted-zone-id Z0659652304JBLJ48Q2DP \
+aws route53 list-resource-record-sets --hosted-zone-id ZEXAMPLE0000000000 \
   --query "ResourceRecordSets[?Name == 'api.weather.craftingnewtech.com.' && Type == 'A']|[0].TTL"
 ```
 Expect `60` as the TTL value (second column) on every `dig` answer line, and

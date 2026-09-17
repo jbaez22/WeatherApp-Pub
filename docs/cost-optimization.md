@@ -121,7 +121,7 @@ aws budgets create-budget \
       "ComparisonOperator": "GREATER_THAN",
       "Threshold": 80
     },
-    "Subscribers": [{"SubscriptionType": "EMAIL", "Address": "joseph.baezb@gmail.com"}]
+    "Subscribers": [{"SubscriptionType": "EMAIL", "Address": "you@example.com"}]
   }]'
 ```
 
