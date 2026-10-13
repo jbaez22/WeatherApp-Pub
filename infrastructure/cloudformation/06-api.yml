@@ -184,6 +184,17 @@ Resources:
       Target: !Sub 'integrations/${LambdaIntegration}'
       AuthorizationType: NONE
 
+  # Search-box autocomplete: returns up to 5 geocoding matches for a
+  # partial city query, so the frontend can disambiguate same-named cities
+  # (e.g. "Woodbourne, NY" vs "Woodbourne, NJ") before fetching weather.
+  SuggestRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WeatherApi
+      RouteKey: 'GET /suggest'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+      AuthorizationType: NONE
+
   # Liveness/region check — Route 53's failover health check polls this
   # (docs/WAPMultiRegion/WeatherApp-MultiRegion-ImplePlan-V1.md §1.1).
   HealthRoute:

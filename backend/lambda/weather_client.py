@@ -10,8 +10,18 @@ Two-step fetch per request (on cache miss):
 Returns a single dict matching the V2 contract expected by frontend/js/app.js:
   { current: {...}, daily: [...7], hourly: [...48], epa_aqi: {...} | absent }
 
-The API key is injected as a parameter — this module never reads from SSM directly,
-keeping it independently testable.
+suggest_cities() is OWM's own geocoding read repurposed for the search-box
+autocomplete dropdown (higher limit, no onecall/air-quality calls) - but OWM
+only does whole-word name matching, not prefix search (confirmed live,
+docs/WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md #1), so
+geonames_suggest_cities() is the one actually wired into GET /suggest - see
+that plan doc for the full rationale. fetch_weather_by_coords() lets the
+handler skip the forward-geocode step entirely once the user has picked an
+exact suggestion, avoiding the risk of a second free-text geocode resolving
+to a different same-named place than the one actually picked.
+
+The API key / GeoNames username are injected as parameters — this module
+never reads from Secrets Manager directly, keeping it independently testable.
 """
 
 import logging
@@ -31,6 +41,20 @@ _ONECALL_URL = "https://api.openweathermap.org/data/3.0/onecall"
 _AIR_POLLUTION_URL = "https://api.openweathermap.org/data/2.5/air_pollution"
 _TIMEOUT_SECONDS = 10
 _UNITS = "metric"  # Always fetch Celsius; C→F conversion happens client-side.
+
+# NOT https://api.geonames.org - that hostname is HTTP-only. GeoNames'
+# free-tier TLS endpoint lives on a dedicated subdomain (confirmed live,
+# valid Let's Encrypt cert for secure.geonames.org, 2026-10-13) - using
+# api.geonames.org here would send the GeoNames username in plaintext.
+_GEONAMES_URL = "https://secure.geonames.org/searchJSON"
+
+# GeoNames signals almost all errors with HTTP 200 and an embedded
+# {"status": {"value": <code>, "message": ...}} object rather than a real
+# HTTP error status (confirmed against GeoNames' own exception-code docs,
+# not assumed) - see _safe_get_geonames().
+_GEONAMES_AUTH_ERROR_CODE = 10
+_GEONAMES_NO_RESULT_CODE = 15
+_GEONAMES_RATE_LIMIT_CODES = {18, 19, 20}  # daily / hourly / weekly credits
 
 
 class WeatherClientError(RuntimeError):
@@ -84,6 +108,65 @@ def _safe_get(url: str, params: dict[str, Any]) -> Any:
         )
 
     return response.json()
+
+
+def _safe_get_geonames(url: str, params: dict[str, Any]) -> dict[str, Any]:
+    """
+    Execute a GET request against the GeoNames API and return the parsed
+    JSON body.
+
+    Unlike _safe_get() (OWM), GeoNames reports almost all failures as
+    HTTP 200 with an embedded {"status": {"value": <code>, "message": ...}}
+    object instead of a real HTTP error status - so a 2xx response alone
+    doesn't mean success here. Raises WeatherClientError on network
+    failures, a genuine non-2xx HTTP response, or a GeoNames status code
+    that represents a real failure (auth, rate limit, etc). The
+    "no result found" status code is treated as a normal empty match, not
+    a failure - returns {} so the caller's `.get("geonames", [])` yields []
+    the same way a real empty `geonames` list would.
+    """
+    try:
+        response = requests.get(url, params=params, timeout=_TIMEOUT_SECONDS)
+    except Timeout as exc:
+        logger.error("Timeout calling GeoNames: %s", url)
+        raise WeatherClientError(
+            "The location service did not respond in time. Please try again."
+        ) from exc
+    except RequestException as exc:
+        logger.error("Network error calling GeoNames: %s", exc)
+        raise WeatherClientError(
+            "Unable to reach the location service. Please try again."
+        ) from exc
+
+    if not response.ok:
+        logger.error("GeoNames returned unexpected HTTP status %d", response.status_code)
+        raise WeatherClientError(
+            f"Location service returned an unexpected error (HTTP {response.status_code})."
+        )
+
+    body = response.json()
+    status = body.get("status")
+    if status is None:
+        return body
+
+    code = status.get("value")
+    message = status.get("message", "")
+
+    if code == _GEONAMES_NO_RESULT_CODE:
+        return {}
+
+    if code == _GEONAMES_AUTH_ERROR_CODE:
+        logger.error("GeoNames authorization error: %s", message)
+        raise WeatherClientError("Location service authentication failed.")
+
+    if code in _GEONAMES_RATE_LIMIT_CODES:
+        logger.warning("GeoNames rate limit hit: %s", message)
+        raise WeatherClientError(
+            "Location service rate limit reached. Please try again shortly."
+        )
+
+    logger.error("GeoNames returned status code %s: %s", code, message)
+    raise WeatherClientError(f"Location service returned an unexpected error: {message}")
 
 
 def _geocode(city: str, api_key: str) -> tuple[float, float, str, str]:
@@ -223,31 +306,104 @@ def reverse_geocode(lat: float, lon: float, api_key: str) -> str:
     return f"{name}, {country}" if country else name
 
 
-def fetch_weather(city: str, api_key: str) -> dict[str, Any]:
+def suggest_cities(query: str, api_key: str, limit: int = 5) -> list[dict[str, Any]]:
     """
-    Fetch current weather, 7-day daily forecast, 48-hour hourly data, and
-    the EPA Air Quality Index for `city`.
+    Return up to `limit` geocoding matches for a partial/ambiguous city
+    query, for the search-box autocomplete dropdown.
 
-    Step 1: Geocode city name → lat/lon + display name  (/geo/1.0/direct)
-    Step 2: One Call API 3.0 (current + daily + hourly) and the Air
-            Pollution API (EPA AQI) run concurrently, since both only
-            depend on the lat/lon resolved in Step 1 - see
-            docs/WeatherApp-AirQuality-Plan-V1.md #4.5 for why this must
-            not be sequential.
+    NOT currently wired into GET /suggest - OWM's geocoding only does
+    whole-word name matching, not prefix search, so it can't actually power
+    an autocomplete-as-you-type dropdown (confirmed live,
+    docs/WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md #1 - e.g.
+    "Woodbourne" matches but "Woodb" does not). geonames_suggest_cities()
+    below is what GET /suggest actually calls. Kept here, unused, only in
+    case a future fallback-on-GeoNames-failure decision wants it (that plan
+    doc's SEC.2 decided against this for now).
+
+    Each result: {"name": str, "state": str, "country": str, "lat": float, "lon": float}
+    `state` is "" when OWM doesn't report one (most non-US locations).
+
+    Unlike _geocode(), an empty result list is a normal "no matches yet"
+    outcome while the user is still typing, not an error - returns []
+    rather than raising CityNotFoundError.
+    """
+    logger.info("Suggesting cities for query: %s", query)
+    results = _safe_get(_GEO_URL, {"q": query, "limit": limit, "appid": api_key})
+
+    return [
+        {
+            "name":    geo["name"],
+            "state":   geo.get("state", ""),
+            "country": geo.get("country", ""),
+            "lat":     geo["lat"],
+            "lon":     geo["lon"],
+        }
+        for geo in results
+    ]
+
+
+def geonames_suggest_cities(query: str, username: str, limit: int = 5) -> list[dict[str, Any]]:
+    """
+    Return up to `limit` GeoNames prefix-search matches for a partial city
+    query - the function actually wired into GET /suggest.
+
+    Uses GeoNames' name_startsWith parameter, which does true prefix
+    matching (unlike OWM's suggest_cities() above) - this is the whole
+    reason this function exists, see
+    docs/WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md.
+
+    Each result: {"name": str, "state": str, "country": str, "lat": float, "lon": float}
+    `state` is "" when GeoNames doesn't report one (most non-US locations).
+    GeoNames returns lat/lng as strings under a differently-named "lng" key
+    (not "lon") - both are normalised here to match the contract shared
+    with suggest_cities() and the frontend.
+
+    An empty/no-match result is a normal "no matches yet" outcome while the
+    user is still typing, not an error - returns [] rather than raising.
+    """
+    logger.info("Suggesting cities (GeoNames) for query: %s", query)
+    body = _safe_get_geonames(_GEONAMES_URL, {
+        "name_startsWith": query,
+        "maxRows":         limit,
+        "featureClass":    "P",
+        "style":           "FULL",
+        "username":        username,
+    })
+
+    results = body.get("geonames", [])
+
+    return [
+        {
+            "name":    geo["name"],
+            "state":   geo.get("adminName1", ""),
+            "country": geo.get("countryCode", ""),
+            "lat":     float(geo["lat"]),
+            "lon":     float(geo["lng"]),
+        }
+        for geo in results
+    ]
+
+
+def _fetch_and_shape(
+    lat: float, lon: float, geo_name: str, geo_country: str, api_key: str, log_label: str
+) -> dict[str, Any]:
+    """
+    Shared second half of the fetch: One Call API 3.0 (current + daily +
+    hourly) and the Air Pollution API run concurrently against an
+    already-resolved lat/lon, since both only depend on that - see
+    docs/WeatherApp-AirQuality-Plan-V1.md #4.5 for why this must not be
+    sequential. Used by both fetch_weather() (geocodes first) and
+    fetch_weather_by_coords() (lat/lon already known from a /suggest pick).
 
     Returns the V2 response contract: { current, daily, hourly, epa_aqi }
     - epa_aqi is omitted entirely if the air-quality fetch/calc failed.
-    Raises CityNotFoundError, WeatherClientError (from the forecast call
-    only - the air-quality call never raises, see _fetch_air_quality).
     """
-    lat, lon, geo_name, geo_country = _geocode(city, api_key)
-
     # NOTE: pipeline/scripts/validate-live-deployment.sh's live-deployment
     # smoke test does an exact CloudWatch Logs filter-pattern substring match
     # on "Fetching One Call 3.0 data for {city}" to prove a real upstream
     # OpenWeatherMap call happened (not a cache hit) - keep that exact phrase
     # intact if this message is ever reworded again.
-    logger.info("Fetching One Call 3.0 data for %s (%.4f, %.4f) + air quality", city, lat, lon)
+    logger.info("Fetching One Call 3.0 data for %s (%.4f, %.4f) + air quality", log_label, lat, lon)
     with ThreadPoolExecutor(max_workers=2) as executor:
         onecall_future = executor.submit(_safe_get, _ONECALL_URL, {
             "lat":     lat,
@@ -265,3 +421,36 @@ def fetch_weather(city: str, api_key: str) -> dict[str, Any]:
     if epa_aqi is not None:
         response["epa_aqi"] = epa_aqi
     return response
+
+
+def fetch_weather(city: str, api_key: str) -> dict[str, Any]:
+    """
+    Fetch current weather, 7-day daily forecast, 48-hour hourly data, and
+    the EPA Air Quality Index for `city`.
+
+    Step 1: Geocode city name → lat/lon + display name  (/geo/1.0/direct)
+    Step 2: see _fetch_and_shape().
+
+    Raises CityNotFoundError, WeatherClientError (from the forecast call
+    only - the air-quality call never raises, see _fetch_air_quality).
+    """
+    lat, lon, geo_name, geo_country = _geocode(city, api_key)
+    return _fetch_and_shape(lat, lon, geo_name, geo_country, api_key, log_label=city)
+
+
+def fetch_weather_by_coords(
+    lat: float, lon: float, geo_name: str, geo_country: str, api_key: str
+) -> dict[str, Any]:
+    """
+    Fetch weather for an exact (lat, lon) the caller already resolved -
+    e.g. the user picked a specific result from /suggest. Skips the
+    forward-geocode step entirely, which also skips its disambiguation
+    risk (re-geocoding a free-text name could resolve to a different
+    same-named place than the one the user actually picked).
+
+    `geo_name`/`geo_country` are used only for display in the response -
+    the weather itself is keyed purely by lat/lon.
+    """
+    return _fetch_and_shape(
+        lat, lon, geo_name, geo_country, api_key, log_label=f"{geo_name}, {geo_country}"
+    )

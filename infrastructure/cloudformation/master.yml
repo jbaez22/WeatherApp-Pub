@@ -250,6 +250,7 @@ Resources:
         LambdaExecutionRoleArn: !GetAtt IamStack.Outputs.LambdaExecutionRoleArn
         DynamoDBTableName: !GetAtt DatabaseStack.Outputs.TableName
         SecretName: !GetAtt SsmStack.Outputs.SecretName
+        GeonamesSecretName: !GetAtt SsmStack.Outputs.GeonamesSecretName
         AllowedOrigin: !Sub 'https://${AlternateDomainName}'
         ArtifactsBucketName: !GetAtt StorageStack.Outputs.ArtifactsBucketName
         LambdaZipKey: !Ref LambdaZipKey

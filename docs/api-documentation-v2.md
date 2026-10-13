@@ -7,14 +7,16 @@
 
 ## What Changed from V1
 
-| Aspect | V1 | V2 |
-|---|---|---|
-| OWM calls per request | 2 (`/weather` + `/forecast`) | 2 (`/geo/1.0/direct` + `/data/3.0/onecall`) |
-| Forecast data | `forecast.list[]` — raw 3-hour intervals | `daily[]` — clean daily summaries (7 days) |
-| Hourly data | Not present | `hourly[]` — 48 hours of data |
-| City resolution | City name sent directly to OWM `/weather` | Geocoded first → lat/lon → One Call |
-| Additional daily fields | None | `pop`, `uvi`, `sunrise`, `sunset`, `humidity`, `wind_speed` |
-| Frontend API URL | `/weather?city={city}` | Unchanged — same endpoint, same parameter |
+| ----------------------- | ----------------------------------------- | ----------------------------------------------------------- |
+| Aspect                  | V1                                        | V2                                                          |
+| ----------------------- | ----------------------------------------- | ----------------------------------------------------------- |
+| OWM calls per request   | 2 (`/weather` + `/forecast`)              | 2 (`/geo/1.0/direct` + `/data/3.0/onecall`)                 |
+| Forecast data           | `forecast.list[]` — raw 3-hour intervals  | `daily[]` — clean daily summaries (7 days)                  |
+| Hourly data             | Not present                               | `hourly[]` — 48 hours of data                               |
+| City resolution         | City name sent directly to OWM `/weather` | Geocoded first → lat/lon → One Call                         |
+| Additional daily fields | None                                      | `pop`, `uvi`, `sunrise`, `sunset`, `humidity`, `wind_speed` |
+| Frontend API URL        | `/weather?city={city}`                    | Unchanged — same endpoint, same parameter                   |
+| ----------------------- | ----------------------------------------- | ----------------------------------------------------------- |
 
 The external API endpoint (`GET /weather?city={city}`) and all error codes are **unchanged**. Only the response body shape changes.
 
@@ -24,19 +26,102 @@ The external API endpoint (`GET /weather?city={city}`) and all error codes are *
 
 ### GET /weather
 
-Identical to V1 — no change to URL, method, parameters, or authentication.
+Two accepted forms, selected by which parameters are present:
 
-**Request**
+**Form A — city name** (unchanged from V1, now accepts commas for
+free-text "City, State" entry, e.g. `Woodbourne, NY`):
 
 ```
 GET https://{api-id}.execute-api.us-east-1.amazonaws.com/weather?city={city}
 ```
 
-| Parameter | Type | Required | Constraints |
-|-----------|------|----------|-------------|
-| `city` | string | Yes | 1–100 chars; letters, spaces, hyphens, periods only |
+| --------- | ------ | -------- | ----------------------------------------------------------- |
+| Parameter | Type   | Required | Constraints                                                 |
+| --------- | ------ | -------- | ----------------------------------------------------------- |
+| `city`    | string | Yes      | 1–100 chars; letters, spaces, hyphens, periods, commas only |
+| --------- | ------ | -------- | ----------------------------------------------------------- |
+
+**Form B — exact coordinates** (added for the search-box autocomplete —
+see `GET /suggest` below). Used when the frontend already has an exact
+`(lat, lon)` from a suggestion the user picked, so it skips the
+forward-geocode step entirely instead of re-resolving `city` as free text
+a second time — the thing that let "Woodbourne, NY" silently resolve to a
+different same-named town than the one actually selected:
+
+```
+GET https://{api-id}.execute-api.us-east-1.amazonaws.com/weather?lat={lat}&lon={lon}&name={name}&country={country}
+```
+
+| --------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
+| Parameter | Type   | Required | Constraints                                                                                                 |
+| --------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `lat`     | float  | Yes      | -90 to 90                                                                                                   |
+| `lon`     | float  | Yes      | -180 to 180                                                                                                 |
+| `name`    | string | Yes      | 1–100 chars; letters, spaces, hyphens, periods only (no comma — it's a single display field, not free text) |
+| `country` | string | No       | ISO 3166-1 alpha-2 code (e.g. `US`)                                                                         |
+| --------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
+
+Triggered whenever either `lat` or `lon` is present in the query string —
+`city` is ignored in that case. Both forms share the same DynamoDB cache
+(15-minute TTL) and the same error codes below; Form B's cache key is the
+coordinates at fixed 4-decimal precision (`"{lat:.4f},{lon:.4f}"`) rather
+than the lowercased city string.
 
 **Headers:** None required. CORS pre-flight (`OPTIONS`) is handled automatically.
+
+---
+
+### GET /suggest
+
+Powers the search-box autocomplete dropdown — returns up to 5 prefix-search
+matches for a partial city query, so the frontend can show the user which
+specific place they mean (state/country) before fetching weather, instead
+of silently guessing via the single best-match forward geocode that
+`GET /weather?city=` does internally.
+
+**Backed by GeoNames, not OpenWeatherMap** (as of
+`docs/WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md`). OWM's geocoding API
+only matches whole words — confirmed live, a query like `woodb` or
+`woodbourn` returned nothing, while `wood` and `woodbourne` (both complete
+place names) worked fine. GeoNames' `name_startsWith` parameter does true
+prefix matching, which is what this endpoint actually needs. OWM continues
+to power everything else (`GET /weather`, `GET /locate`, the actual weather
+data) — this is additive, not a provider migration.
+
+```
+GET https://{api-id}.execute-api.us-east-1.amazonaws.com/suggest?q={partial name}
+```
+
+| --------- | ------ | -------- | ----------------------------------- |
+| Parameter | Type   | Required | Constraints                         |
+| --------- | ------ | -------- | ----------------------------------- |
+| `q`       | string | Yes      | 1–100 chars; same charset as `city` |
+| --------- | ------ | -------- | ----------------------------------- |
+
+**Response (200):**
+```json
+{
+  "suggestions": [
+    {"name": "Woodbourne", "state": "New York", "country": "US", "lat": 41.7343, "lon": -74.6104},
+    {"name": "Woodbourne", "state": "New Jersey", "country": "US", "lat": 41.1998, "lon": -74.6821}
+  ]
+}
+```
+
+`state` is `""` when GeoNames doesn't report one (most non-US locations).
+
+**Always returns 200 with `{"suggestions": []}`** rather than an error
+for: a query shorter than 2 characters, a credential-retrieval failure, or
+an upstream GeoNames failure — the dropdown is a non-essential assist, so a
+degraded suggest path must never block the user from submitting the
+search form directly with whatever they've typed. A 400 is only returned
+if `q` itself fails the same charset/length validation as `city`. No
+fallback to OWM's geocoding on a GeoNames failure by design (see
+`WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md` SEC.2) — it would just
+reintroduce the whole-word-only limitation during the fallback window.
+
+Each result's `lat`/`lon`/`name`/`country` are the exact values to pass to
+`GET /weather`'s Form B above when the user picks that suggestion.
 
 ---
 
@@ -101,46 +186,52 @@ GET https://{api-id}.execute-api.us-east-1.amazonaws.com/weather?city={city}
 
 Identical field names to V1 — `renderCurrent()` on the frontend requires no changes.
 
-| Field | Type | Description |
-|---|---|---|
-| `name` | string | City display name (from geocoding, not One Call) |
-| `sys.country` | string | ISO 3166-1 alpha-2 country code |
-| `dt` | integer | Current observation timestamp (Unix seconds, UTC) |
-| `main.temp` | float | Current temperature in Celsius |
-| `main.feels_like` | float | Perceived temperature in Celsius |
-| `main.humidity` | integer | Relative humidity (%) |
-| `main.pressure` | integer | Atmospheric pressure (hPa) |
-| `wind.speed` | float | Wind speed in m/s (frontend converts to km/h: × 3.6) |
-| `visibility` | integer | Visibility in metres (max 10,000) |
-| `weather[0].icon` | string | OWM icon code (e.g. `"01d"`) |
-| `weather[0].description` | string | Human-readable condition (e.g. `"clear sky"`) |
+| ------------------------ | ------- | ---------------------------------------------------- |
+| Field                    | Type    | Description                                          |
+| ------------------------ | ------- | ---------------------------------------------------- |
+| `name`                   | string  | City display name (from geocoding, not One Call)     |
+| `sys.country`            | string  | ISO 3166-1 alpha-2 country code                      |
+| `dt`                     | integer | Current observation timestamp (Unix seconds, UTC)    |
+| `main.temp`              | float   | Current temperature in Celsius                       |
+| `main.feels_like`        | float   | Perceived temperature in Celsius                     |
+| `main.humidity`          | integer | Relative humidity (%)                                |
+| `main.pressure`          | integer | Atmospheric pressure (hPa)                           |
+| `wind.speed`             | float   | Wind speed in m/s (frontend converts to km/h: × 3.6) |
+| `visibility`             | integer | Visibility in metres (max 10,000)                    |
+| `weather[0].icon`        | string  | OWM icon code (e.g. `"01d"`)                         |
+| `weather[0].description` | string  | Human-readable condition (e.g. `"clear sky"`)        |
+| ------------------------ | ------- | ---------------------------------------------------- |
 
 #### `daily` array — 7 entries (today + 6 days)
 
-| Field | Type | Description |
-|---|---|---|
-| `dt` | integer | Noon timestamp for this day (Unix seconds, UTC) |
-| `high` | float | Daily maximum temperature (Celsius) |
-| `low` | float | Daily minimum temperature (Celsius) |
-| `icon` | string | OWM icon code for the dominant condition |
-| `desc` | string | Human-readable condition description |
-| `pop` | float | Precipitation probability (0.0–1.0); display as `Math.round(pop * 100) + '%'` |
-| `uvi` | float | UV index (0–11+); display as `Math.round(uvi)` |
-| `sunrise` | integer | Sunrise timestamp (Unix seconds, UTC) |
-| `sunset` | integer | Sunset timestamp (Unix seconds, UTC) |
-| `humidity` | integer | Average relative humidity for the day (%) |
-| `wind_speed` | float | Average wind speed in m/s |
+| ------------ | ------- | ----------------------------------------------------------------------------- |
+| Field        | Type    | Description                                                                   |
+| ------------ | ------- | ----------------------------------------------------------------------------- |
+| `dt`         | integer | Noon timestamp for this day (Unix seconds, UTC)                               |
+| `high`       | float   | Daily maximum temperature (Celsius)                                           |
+| `low`        | float   | Daily minimum temperature (Celsius)                                           |
+| `icon`       | string  | OWM icon code for the dominant condition                                      |
+| `desc`       | string  | Human-readable condition description                                          |
+| `pop`        | float   | Precipitation probability (0.0–1.0); display as `Math.round(pop * 100) + '%'` |
+| `uvi`        | float   | UV index (0–11+); display as `Math.round(uvi)`                                |
+| `sunrise`    | integer | Sunrise timestamp (Unix seconds, UTC)                                         |
+| `sunset`     | integer | Sunset timestamp (Unix seconds, UTC)                                          |
+| `humidity`   | integer | Average relative humidity for the day (%)                                     |
+| `wind_speed` | float   | Average wind speed in m/s                                                     |
+| ------------ | ------- | ----------------------------------------------------------------------------- |
 
 #### `hourly` array — 48 entries (next 48 hours)
 
-| Field | Type | Description |
-|---|---|---|
-| `dt` | integer | Hour timestamp (Unix seconds, UTC) |
-| `temp` | float | Temperature in Celsius |
-| `feels_like` | float | Perceived temperature in Celsius |
-| `icon` | string | OWM icon code |
-| `desc` | string | Human-readable condition description |
-| `pop` | float | Precipitation probability (0.0–1.0) |
+| ------------ | ------- | ------------------------------------ |
+| Field        | Type    | Description                          |
+| ------------ | ------- | ------------------------------------ |
+| `dt`         | integer | Hour timestamp (Unix seconds, UTC)   |
+| `temp`       | float   | Temperature in Celsius               |
+| `feels_like` | float   | Perceived temperature in Celsius     |
+| `icon`       | string  | OWM icon code                        |
+| `desc`       | string  | Human-readable condition description |
+| `pop`        | float   | Precipitation probability (0.0–1.0)  |
+| ------------ | ------- | ------------------------------------ |
 
 **Filtering hourly by day:** The frontend selects entries for a given day by comparing `new Date(entry.dt * 1000).toDateString()` against the day card's `dt`. This handles timezone differences correctly since both use the browser's local date string.
 
@@ -186,14 +277,19 @@ longer what the deployed frontend calls.
 
 All error codes and shapes are **unchanged from V1**.
 
-| HTTP Status | `error` | `message` | Cause |
-|---|---|---|---|
-| 400 | `true` | `"City parameter is required..."` | Missing or empty city |
-| 400 | `true` | `"City name may only contain..."` | Invalid characters in city name |
-| 404 | `true` | `"City not found..."` | Geocoding returned no results |
-| 429 | `true` | `"Weather service rate limit..."` | OWM rate limit hit |
-| 502 | `true` | `"Unable to reach the weather service..."` | OWM API unreachable |
-| 503 | `true` | `"Weather service temporarily unavailable..."` | SSM credential fetch failed |
+| ----------- | ------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| HTTP Status | `error` | `message`                                                                     | Cause                                                        |
+| ----------- | ------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| 400         | `true`  | `"City parameter is required..."`                                             | Missing or empty city                                        |
+| 400         | `true`  | `"City name may only contain letters, spaces, hyphens, periods, and commas."` | Invalid characters in city name                              |
+| 400         | `true`  | `"'lat' must be between -90.0 and 90.0."`                                     | Form B: invalid/out-of-range coordinate                      |
+| 400         | `true`  | `"'name' parameter is required."`                                             | Form B: missing display name                                 |
+| 404         | `true`  | `"City not found..."`                                                         | Geocoding returned no results (Form A)                       |
+| 404         | `true`  | `"Weather data was not found for that location."`                             | One Call returned nothing for the given coordinates (Form B) |
+| 429         | `true`  | `"Weather service rate limit..."`                                             | OWM rate limit hit                                           |
+| 502         | `true`  | `"Unable to reach the weather service..."`                                    | OWM API unreachable                                          |
+| 503         | `true`  | `"Weather service temporarily unavailable..."`                                | SSM credential fetch failed                                  |
+| ----------- | ------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------ |
 
 ```json
 {
@@ -312,6 +408,20 @@ function getHoursForDay(hourlyData, dayDt) {
 When the unit toggle fires, if a card is currently expanded, re-render the hourly panel with the new unit in addition to updating the forecast cards.
 
 ---
+
+## GET /suggest — Cost Impact
+
+**Cost impact: ~$0.80/mo.** `geonames_suggest_cities()` calls GeoNames'
+free-tier `searchJSON` endpoint (`secure.geonames.org`) — GeoNames itself is
+$0.00/mo (a free account, credit-limited rather than billed; see
+`WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md` §3 for the exact
+daily/hourly limits, which GeoNames documents inconsistently across its own
+pages). The real cost is the AWS side: a second Secrets Manager secret for
+the GeoNames username, at $0.40/secret/month × 2 regions (primary +
+`ReplicaRegions` replica) = **$0.80/mo**, verified against current AWS
+pricing (no free tier on Secrets Manager). The frontend debounces keystrokes
+(300ms) and caches results per query string for the session, so normal
+typing generates far fewer than one call per keystroke either way.
 
 ## OWM One Call API 3.0 — Subscription Notes
 

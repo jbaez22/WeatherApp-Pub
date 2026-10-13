@@ -12,7 +12,13 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lambda"))
 
-from validators import ValidationError, validate_city, validate_coordinates
+from validators import (
+    ValidationError,
+    validate_city,
+    validate_coordinates,
+    validate_country_code,
+    validate_location_name,
+)
 
 
 class TestValidateCityHappyPath:
@@ -40,6 +46,12 @@ class TestValidateCityHappyPath:
 
     def test_single_character_city(self):
         assert validate_city("A") == "a"
+
+    def test_city_state_with_comma_accepted(self):
+        assert validate_city("Woodbourne, NY") == "woodbourne, ny"
+
+    def test_city_state_country_with_commas_accepted(self):
+        assert validate_city("Woodbourne, New York, US") == "woodbourne, new york, us"
 
 
 class TestValidateCityRejections:
@@ -139,3 +151,88 @@ class TestValidateCoordinatesRejections:
     def test_lon_too_low_raises(self):
         with pytest.raises(ValidationError, match="'lon'"):
             validate_coordinates("0", "-180.1")
+
+
+class TestValidateLocationNameHappyPath:
+    def test_simple_name_returned_trimmed(self):
+        assert validate_location_name("  Woodbourne  ", "name") == "Woodbourne"
+
+    def test_case_preserved_unlike_validate_city(self):
+        """Unlike validate_city(), this is a display field picked from an
+        authoritative /suggest result - no need to normalise case."""
+        assert validate_location_name("Woodbourne", "name") == "Woodbourne"
+
+    def test_hyphenated_name_accepted(self):
+        assert validate_location_name("Winston-Salem", "name") == "Winston-Salem"
+
+
+class TestValidateLocationNameRejections:
+    def test_empty_string_raises(self):
+        with pytest.raises(ValidationError, match="required"):
+            validate_location_name("", "name")
+
+    def test_whitespace_only_raises(self):
+        with pytest.raises(ValidationError, match="required"):
+            validate_location_name("   ", "name")
+
+    def test_101_characters_raises(self):
+        with pytest.raises(ValidationError, match="100"):
+            validate_location_name("a" * 101, "name")
+
+    def test_comma_rejected(self):
+        """Name arrives as its own field now - a comma suggests a caller
+        is smuggling a full 'city, state' string through the wrong param."""
+        with pytest.raises(ValidationError, match="letters"):
+            validate_location_name("Woodbourne, NY", "name")
+
+    def test_digits_rejected(self):
+        with pytest.raises(ValidationError, match="letters"):
+            validate_location_name("City123", "name")
+
+    def test_script_injection_rejected(self):
+        with pytest.raises(ValidationError, match="letters"):
+            validate_location_name("<script>alert(1)</script>", "name")
+
+    def test_non_string_type_raises(self):
+        with pytest.raises(ValidationError, match="string"):
+            validate_location_name(None, "name")
+
+    def test_field_label_included_in_error(self):
+        with pytest.raises(ValidationError, match="'country-name'"):
+            validate_location_name("", "country-name")
+
+
+class TestValidateCountryCodeHappyPath:
+    def test_valid_code_uppercased(self):
+        assert validate_country_code("us") == "US"
+
+    def test_already_uppercase_unchanged(self):
+        assert validate_country_code("GB") == "GB"
+
+    def test_empty_string_returns_empty_string(self):
+        """Country is optional - some OWM geocoding results omit it."""
+        assert validate_country_code("") == ""
+
+    def test_whitespace_only_returns_empty_string(self):
+        assert validate_country_code("   ") == ""
+
+    def test_whitespace_trimmed(self):
+        assert validate_country_code("  US  ") == "US"
+
+
+class TestValidateCountryCodeRejections:
+    def test_single_letter_raises(self):
+        with pytest.raises(ValidationError, match="2-letter"):
+            validate_country_code("U")
+
+    def test_three_letters_raises(self):
+        with pytest.raises(ValidationError, match="2-letter"):
+            validate_country_code("USA")
+
+    def test_digits_rejected(self):
+        with pytest.raises(ValidationError, match="2-letter"):
+            validate_country_code("U1")
+
+    def test_non_string_type_raises(self):
+        with pytest.raises(ValidationError, match="string"):
+            validate_country_code(None)

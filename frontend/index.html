@@ -73,7 +73,30 @@
             maxlength="100"
             aria-required="true"
             aria-describedby="search-hint"
+            role="combobox"
+            aria-expanded="false"
+            aria-controls="suggestions-list"
+            aria-autocomplete="list"
           />
+          <button
+            type="button"
+            class="clear-input-btn"
+            id="clear-input-btn"
+            aria-label="Clear search"
+            title="Clear search"
+            hidden
+          >
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </button>
+          <ul
+            class="suggestions-list"
+            id="suggestions-list"
+            role="listbox"
+            aria-label="City suggestions"
+            hidden
+          ></ul>
         </div>
         <button type="submit" class="btn btn--primary" id="search-btn">
           Get Weather
@@ -81,6 +104,8 @@
       </form>
       <p id="search-hint" class="search-attribution">
         Powered by <a href="https://openweathermap.org" target="_blank" rel="noopener noreferrer">OpenWeatherMap</a>
+        and <a href="https://www.geonames.org" target="_blank" rel="noopener noreferrer">GeoNames</a>
+        (<a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener noreferrer">CC BY 4.0</a>)
       </p>
     </section>
 

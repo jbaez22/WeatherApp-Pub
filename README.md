@@ -17,10 +17,11 @@ User → Route 53 Failover (api.weather.craftingnewtech.com)
      → Lambda (Python 3.11)
      → SSM Parameter Store (API Key) / Secrets Manager (cross-region replica)
      → DynamoDB Global Tables (15-min Weather Cache, replicated)
-     → OpenWeatherMap API (One Call 3.0)
+     → OpenWeatherMap API (One Call 3.0) — weather data
+     → GeoNames API (name_startsWith prefix search) — city autocomplete
 ```
 
-![Multi-Region Architecture](docs/WAPMultiRegion/weatherapp-multi-region-architecture.svg)
+![Multi-Region Architecture](docs/WAPMultiRegion/weatherapp-multi-region-architecture-v2.svg)
 
 All infrastructure is defined in CloudFormation. All deployments run through two independent CodePipelines (Infra + App — see `docs/WeatherApp-PipeSplit-ImplePlan-V1.md`). No manual steps after initial bootstrap. Automatic active-passive regional failover is documented in `docs/WAPMultiRegion/`.
 

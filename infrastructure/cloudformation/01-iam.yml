@@ -134,11 +134,19 @@ Resources:
                 # deployed there) — the second, explicit entry below covers
                 # the secondary region's secret replica once it exists, for
                 # the same reason as DynamoDBCacheAccess above.
+                #
+                # GeoNames username secret (docs/WeatherApp-GeoNames-Suggest-
+                # Upgrade-Plan-V1.md SEC.3) follows the identical
+                # ProjectName-built-wildcard pattern as the OWM entries above,
+                # for the identical reason — avoids the same GetAtt deadlock.
                 Resource: !If
                   - HasSecondaryRegion
                   - - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/openweathermap-api-key-*'
                     - !Sub 'arn:aws:secretsmanager:${SecondaryRegion}:${AWS::AccountId}:secret:${ProjectName}/openweathermap-api-key-*'
-                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/openweathermap-api-key-*'
+                    - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/geonames-username-*'
+                    - !Sub 'arn:aws:secretsmanager:${SecondaryRegion}:${AWS::AccountId}:secret:${ProjectName}/geonames-username-*'
+                  - - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/openweathermap-api-key-*'
+                    - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/geonames-username-*'
       Tags:
         - Key: Project
           Value: !Ref ProjectName

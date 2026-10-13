@@ -12,12 +12,15 @@ import CONFIG from './config.js';
 import { CATEGORIES as AQI_CATEGORIES, renderAirQualityData } from './aqi_gauge.js';
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
-const CITY_REGEX  = /^[a-zA-Z\s\-\.]{1,100}$/;
+const CITY_REGEX  = /^[a-zA-Z\s\-\.,]{1,100}$/;
 const ICON_BASE   = 'https://openweathermap.org/img/wn/';
 const LOCAL_ICONS = new Set([
   '01d','01n','02d','02n','03d','03n','04d','04n',
   '09d','09n','10d','10n','11d','11n','13d','13n','50d','50n',
 ]);
+
+const SUGGEST_MIN_LENGTH   = 2;
+const SUGGEST_DEBOUNCE_MS  = 300;
 
 /* ── State ──────────────────────────────────────────────────────────────── */
 let currentUnit      = 'F';   // 'C' | 'F'
@@ -25,6 +28,14 @@ let currentWeather   = null;  // raw Celsius data from API
 let forecastData     = [];    // V2 daily array (7 entries, Celsius)
 let hourlyData       = [];    // V2 hourly array (48 entries, Celsius)
 let expandedDayIndex = null;  // index of the currently open forecast card
+
+/* ── Suggestions (search-box autocomplete) state ─────────────────────────── */
+let suggestions           = [];   // current /suggest results
+let activeSuggestionIndex = -1;   // keyboard-highlighted index, -1 = none
+let selectedSuggestion    = null; // the exact suggestion chosen, cleared on any further typing
+let suggestDebounceTimer  = null;
+let suggestAbortController = null;
+const suggestionsCache    = new Map(); // query -> suggestions[], session-lifetime only
 
 /* ── DOM refs ────────────────────────────────────────────────────────────── */
 const form          = document.getElementById('search-form');
@@ -48,6 +59,8 @@ const aqiBadge      = document.getElementById('aqi-summary-badge');
 const aqiBadgeLabel = document.getElementById('aqi-summary-label');
 const aqiPollutant  = document.getElementById('aqi-pollutant');
 const aqiTimestamp  = document.getElementById('aqi-timestamp');
+const clearBtn        = document.getElementById('clear-input-btn');
+const suggestionsList = document.getElementById('suggestions-list');
 
 const AQI_BADGE_CLASSES = AQI_CATEGORIES.map((c) => `aqi-badge--${c.badgeClass}`);
 
@@ -113,17 +126,14 @@ function validateCity(raw) {
   if (!CITY_REGEX.test(trimmed)) {
     return {
       ok: false,
-      reason: 'City name may only contain letters, spaces, hyphens, and periods.',
+      reason: 'City name may only contain letters, spaces, hyphens, periods, and commas.',
     };
   }
   return { ok: true, value: trimmed };
 }
 
-/* ── API call ────────────────────────────────────────────────────────────── */
-async function fetchWeather(city) {
-  const url = new URL(`${CONFIG.API_BASE_URL}/weather`);
-  url.searchParams.set('city', city);
-
+/* ── API calls ───────────────────────────────────────────────────────────── */
+async function fetchJson(url) {
   const resp = await fetch(url.toString(), {
     method:  'GET',
     headers: { 'Content-Type': 'application/json' },
@@ -139,6 +149,40 @@ async function fetchWeather(city) {
   }
 
   return resp.json();
+}
+
+function fetchWeatherByCity(city) {
+  const url = new URL(`${CONFIG.API_BASE_URL}/weather`);
+  url.searchParams.set('city', city);
+  return fetchJson(url);
+}
+
+function fetchWeatherByCoords({ lat, lon, name, country }) {
+  const url = new URL(`${CONFIG.API_BASE_URL}/weather`);
+  url.searchParams.set('lat', lat);
+  url.searchParams.set('lon', lon);
+  url.searchParams.set('name', name);
+  url.searchParams.set('country', country || '');
+  return fetchJson(url);
+}
+
+async function fetchSuggestions(query, signal) {
+  if (suggestionsCache.has(query)) return suggestionsCache.get(query);
+
+  const url = new URL(`${CONFIG.API_BASE_URL}/suggest`);
+  url.searchParams.set('q', query);
+
+  const resp = await fetch(url.toString(), {
+    method:  'GET',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+  });
+  if (!resp.ok) return [];
+
+  const body = await resp.json();
+  const results = Array.isArray(body.suggestions) ? body.suggestions : [];
+  suggestionsCache.set(query, results);
+  return results;
 }
 
 /* ── Render current weather ──────────────────────────────────────────────── */
@@ -415,49 +459,64 @@ function renderHourly(dayIndex, dayDt) {
 }
 
 /* ── Main fetch + render flow ────────────────────────────────────────────── */
+function renderWeatherResponse(data) {
+  currentWeather     = data.current;
+  forecastData       = Array.isArray(data.daily)  ? data.daily  : [];
+  hourlyData         = Array.isArray(data.hourly) ? data.hourly : [];
+  expandedDayIndex   = null;
+  hourlyStrip.hidden = true;
+
+  setLoading(false);
+  hide(errorCard);
+  renderCurrent(currentWeather);
+  show(weatherCard);
+
+  if (forecastData.length > 0) {
+    document.getElementById('forecast-title').textContent = '7-Day Forecast';
+    renderForecast();
+    show(forecastSec);
+  }
+
+  // Non-fatal by design (see backend/lambda/weather_client.py) - epa_aqi
+  // is simply absent from the response if the air-quality fetch/calc
+  // failed, and the rest of the page above is entirely unaffected.
+  if (data.epa_aqi) {
+    const locationText = `${currentWeather.name}, ${currentWeather.sys.country}`;
+    renderAirQuality(data.epa_aqi, locationText);
+  } else {
+    hideAirQuality();
+  }
+}
+
+function handleWeatherError(err) {
+  setLoading(false);
+  const isNetworkErr = err instanceof TypeError;
+  if (isNetworkErr) {
+    showError('Unable to reach the weather service. Check your connection and try again.');
+  } else if (err.message === 'HTTP 404' || err.message.toLowerCase().includes('not found')) {
+    showError('City not found. Please check the spelling and try again.');
+  } else if (err.message === 'HTTP 429') {
+    showError('Too many requests. Please wait a moment and try again.');
+  } else {
+    showError('Something went wrong. Please try again shortly.');
+  }
+}
+
 async function loadWeather(city) {
   setLoading(true);
   try {
-    const data = await fetchWeather(city);
-
-    currentWeather     = data.current;
-    forecastData       = Array.isArray(data.daily)  ? data.daily  : [];
-    hourlyData         = Array.isArray(data.hourly) ? data.hourly : [];
-    expandedDayIndex   = null;
-    hourlyStrip.hidden = true;
-
-    setLoading(false);
-    hide(errorCard);
-    renderCurrent(currentWeather);
-    show(weatherCard);
-
-    if (forecastData.length > 0) {
-      document.getElementById('forecast-title').textContent = '7-Day Forecast';
-      renderForecast();
-      show(forecastSec);
-    }
-
-    // Non-fatal by design (see backend/lambda/weather_client.py) - epa_aqi
-    // is simply absent from the response if the air-quality fetch/calc
-    // failed, and the rest of the page above is entirely unaffected.
-    if (data.epa_aqi) {
-      const locationText = `${currentWeather.name}, ${currentWeather.sys.country}`;
-      renderAirQuality(data.epa_aqi, locationText);
-    } else {
-      hideAirQuality();
-    }
+    renderWeatherResponse(await fetchWeatherByCity(city));
   } catch (err) {
-    setLoading(false);
-    const isNetworkErr = err instanceof TypeError;
-    if (isNetworkErr) {
-      showError('Unable to reach the weather service. Check your connection and try again.');
-    } else if (err.message === 'HTTP 404' || err.message.toLowerCase().includes('not found')) {
-      showError('City not found. Please check the spelling and try again.');
-    } else if (err.message === 'HTTP 429') {
-      showError('Too many requests. Please wait a moment and try again.');
-    } else {
-      showError('Something went wrong. Please try again shortly.');
-    }
+    handleWeatherError(err);
+  }
+}
+
+async function loadWeatherForSuggestion(suggestion) {
+  setLoading(true);
+  try {
+    renderWeatherResponse(await fetchWeatherByCoords(suggestion));
+  } catch (err) {
+    handleWeatherError(err);
   }
 }
 
@@ -486,10 +545,182 @@ function setUnit(unit) {
   }
 }
 
+/* ── Suggestions (search-box autocomplete) ───────────────────────────────── */
+function createPinIcon() {
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.classList.add('suggestion-item__icon');
+
+  const path = document.createElementNS(svgNS, 'path');
+  path.setAttribute('d', 'M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7Z');
+  path.setAttribute('stroke', 'currentColor');
+  path.setAttribute('stroke-width', '2');
+  path.setAttribute('stroke-linejoin', 'round');
+
+  const circle = document.createElementNS(svgNS, 'circle');
+  circle.setAttribute('cx', '12');
+  circle.setAttribute('cy', '9');
+  circle.setAttribute('r', '2.5');
+  circle.setAttribute('stroke', 'currentColor');
+  circle.setAttribute('stroke-width', '2');
+
+  svg.appendChild(path);
+  svg.appendChild(circle);
+  return svg;
+}
+
+function suggestionMeta(s) {
+  return s.state ? `${s.state}, ${s.country}` : s.country;
+}
+
+function showSuggestionsList() {
+  suggestionsList.hidden = false;
+  cityInput.setAttribute('aria-expanded', 'true');
+}
+
+function hideSuggestionsList() {
+  suggestionsList.hidden = true;
+  cityInput.setAttribute('aria-expanded', 'false');
+  cityInput.removeAttribute('aria-activedescendant');
+  activeSuggestionIndex = -1;
+}
+
+function clearSuggestions() {
+  suggestions = [];
+  selectedSuggestion = null;
+  hideSuggestionsList();
+}
+
+function updateClearButton() {
+  clearBtn.hidden = cityInput.value.length === 0;
+}
+
+function setActiveSuggestion(index) {
+  const items = suggestionsList.querySelectorAll('.suggestion-item:not(.suggestion-item--empty)');
+  items.forEach((el) => {
+    el.classList.remove('suggestion-item--active');
+    el.setAttribute('aria-selected', 'false');
+  });
+
+  if (index < 0 || index >= items.length) {
+    activeSuggestionIndex = -1;
+    cityInput.removeAttribute('aria-activedescendant');
+    return;
+  }
+
+  activeSuggestionIndex = index;
+  const activeEl = items[index];
+  activeEl.classList.add('suggestion-item--active');
+  activeEl.setAttribute('aria-selected', 'true');
+  activeEl.scrollIntoView({ block: 'nearest' });
+  cityInput.setAttribute('aria-activedescendant', activeEl.id);
+}
+
+function selectSuggestion(index) {
+  const s = suggestions[index];
+  if (!s) return;
+
+  selectedSuggestion = s;
+  cityInput.value = s.state ? `${s.name}, ${s.state}` : `${s.name}, ${s.country}`;
+  cityInput.classList.remove('is-invalid');
+  cityInput.removeAttribute('aria-invalid');
+  hideSuggestionsList();
+  updateClearButton();
+  hide(errorCard);
+  loadWeatherForSuggestion(s);
+}
+
+function renderSuggestions() {
+  while (suggestionsList.firstChild) suggestionsList.removeChild(suggestionsList.firstChild);
+  activeSuggestionIndex = -1;
+
+  if (suggestions.length === 0) {
+    const li = document.createElement('li');
+    li.className = 'suggestion-item suggestion-item--empty';
+    li.textContent = 'No matching cities found.';
+    suggestionsList.appendChild(li);
+    showSuggestionsList();
+    return;
+  }
+
+  suggestions.forEach((s, i) => {
+    const li = document.createElement('li');
+    li.className = 'suggestion-item';
+    li.id = `suggestion-opt-${i}`;
+    li.setAttribute('role', 'option');
+    li.setAttribute('aria-selected', 'false');
+    li.appendChild(createPinIcon());
+
+    const textWrap = document.createElement('div');
+    textWrap.className = 'suggestion-item__text';
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'suggestion-item__name';
+    nameEl.textContent = s.name;
+
+    const metaEl = document.createElement('span');
+    metaEl.className = 'suggestion-item__meta';
+    metaEl.textContent = suggestionMeta(s);
+
+    textWrap.appendChild(nameEl);
+    textWrap.appendChild(metaEl);
+    li.appendChild(textWrap);
+
+    // mousedown (not click) fires before the input's focus would be lost,
+    // and preventDefault() here keeps focus on the input entirely - so
+    // there's no blur to race against the selection.
+    li.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      selectSuggestion(i);
+    });
+
+    suggestionsList.appendChild(li);
+  });
+
+  showSuggestionsList();
+}
+
+async function handleCityInputTyped() {
+  const query = cityInput.value.trim();
+
+  if (query.length < SUGGEST_MIN_LENGTH) {
+    clearSuggestions();
+    return;
+  }
+
+  if (suggestAbortController) suggestAbortController.abort();
+  suggestAbortController = new AbortController();
+
+  try {
+    const results = await fetchSuggestions(query, suggestAbortController.signal);
+    // Stale-response guard: only render if the input still matches what
+    // this particular request was for (the user may have kept typing).
+    if (cityInput.value.trim() !== query) return;
+    suggestions = results;
+    renderSuggestions();
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      // Non-fatal - the dropdown just doesn't show; the user can still
+      // submit the form with the free-text value they've typed.
+      clearSuggestions();
+    }
+  }
+}
+
 /* ── Event listeners ─────────────────────────────────────────────────────── */
 form.addEventListener('submit', (e) => {
   e.preventDefault();
+  hideSuggestionsList();
   cityInput.classList.remove('is-invalid');
+
+  if (selectedSuggestion) {
+    hide(errorCard);
+    loadWeatherForSuggestion(selectedSuggestion);
+    return;
+  }
 
   const validation = validateCity(cityInput.value);
   if (!validation.ok) {
@@ -507,6 +738,44 @@ form.addEventListener('submit', (e) => {
 cityInput.addEventListener('input', () => {
   cityInput.classList.remove('is-invalid');
   cityInput.removeAttribute('aria-invalid');
+  selectedSuggestion = null;
+  updateClearButton();
+
+  clearTimeout(suggestDebounceTimer);
+  suggestDebounceTimer = setTimeout(handleCityInputTyped, SUGGEST_DEBOUNCE_MS);
+});
+
+cityInput.addEventListener('keydown', (e) => {
+  if (suggestionsList.hidden || suggestions.length === 0) return;
+
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    setActiveSuggestion((activeSuggestionIndex + 1) % suggestions.length);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    setActiveSuggestion((activeSuggestionIndex - 1 + suggestions.length) % suggestions.length);
+  } else if (e.key === 'Enter') {
+    if (activeSuggestionIndex >= 0) {
+      e.preventDefault();
+      selectSuggestion(activeSuggestionIndex);
+    }
+    // else: no suggestion highlighted - let the form's submit handler run.
+  } else if (e.key === 'Escape') {
+    hideSuggestionsList();
+  }
+});
+
+clearBtn.addEventListener('click', () => {
+  cityInput.value = '';
+  clearSuggestions();
+  updateClearButton();
+  cityInput.classList.remove('is-invalid');
+  cityInput.removeAttribute('aria-invalid');
+  cityInput.focus();
+});
+
+document.addEventListener('click', (e) => {
+  if (!form.contains(e.target)) hideSuggestionsList();
 });
 
 btnCelsius.addEventListener('click',    () => setUnit('C'));
@@ -557,6 +826,8 @@ locateBtn.addEventListener('click', () => {
         cityInput.value = cityName;
         cityInput.classList.remove('is-invalid');
         cityInput.removeAttribute('aria-invalid');
+        clearSuggestions();
+        updateClearButton();
         hide(errorCard);
         loadWeather(cityName);
       } catch {

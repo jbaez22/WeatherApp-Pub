@@ -902,6 +902,23 @@ be investigated fully before dismissing.
   aws secretsmanager describe-secret --secret-id weather-dashboard/openweathermap-api-key \
     --query '{LastRotatedDate:LastRotatedDate,NextRotationDate:NextRotationDate}'
   ```
+- **GeoNames username — no scheduled rotation, documented here for
+  completeness** (`docs/WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md`).
+  Unlike the OWM key, this isn't a rotatable credential — it's a free-tier
+  account identifier with no `RotationSchedule` attached. If it's ever
+  suspected exposed, rotate manually by generating a new GeoNames account
+  and setting the new username the same way the original was set (see that
+  plan doc's SEC.5):
+  ```bash
+  aws secretsmanager put-secret-value \
+    --secret-id "weather-dashboard/geonames-username" \
+    --secret-string "NEW_USERNAME_HERE"
+  ```
+  Confirm when it was last changed:
+  ```bash
+  aws secretsmanager describe-secret --secret-id weather-dashboard/geonames-username \
+    --query '{LastChangedDate:LastChangedDate}'
+  ```
 
 ### Before any infrastructure change
 - Run `bash pipeline/scripts/validate-templates.sh` and `bash

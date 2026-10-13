@@ -26,9 +26,29 @@ from aws_xray_sdk.core import patch_all
 patch_all()
 
 from cache import CacheError, get_cached_weather, get_stale_cached_weather, set_cached_weather
-from secrets_manager import SecretsError, get_api_key
-from validators import ValidationError, validate_city, validate_coordinates
-from weather_client import CityNotFoundError, WeatherClientError, fetch_weather, reverse_geocode
+from secrets_manager import SecretsError, get_api_key, get_geonames_username
+from validators import (
+    ValidationError,
+    validate_city,
+    validate_coordinates,
+    validate_country_code,
+    validate_location_name,
+)
+from weather_client import (
+    CityNotFoundError,
+    WeatherClientError,
+    fetch_weather,
+    fetch_weather_by_coords,
+    geonames_suggest_cities,
+    reverse_geocode,
+)
+
+# /suggest fires on every debounced keystroke - don't call OWM for a query
+# this short, it can't narrow anything down yet. Mirrors the frontend's own
+# minimum-length gate so the behavior is consistent even if that JS check
+# is ever bypassed (devtools, a different client).
+_SUGGEST_MIN_LENGTH = 2
+_SUGGEST_LIMIT = 5
 
 # Log level is configurable via Lambda environment variable.
 # logging.basicConfig() is a no-op here: the Lambda Python runtime already
@@ -71,7 +91,19 @@ def _error(status_code: int, message: str) -> dict[str, Any]:
 
 
 def _handle_weather(query_params: dict[str, str]) -> dict[str, Any]:
-    """Handle GET /weather?city=<name>."""
+    """
+    Handle GET /weather?city=<name>
+        or  GET /weather?lat=<f>&lon=<f>&name=<name>&country=<code>
+
+    The lat/lon form is used when the user picked an exact result from
+    GET /suggest - it skips the forward-geocode step entirely (see
+    weather_client.fetch_weather_by_coords), avoiding the disambiguation
+    risk of a second free-text geocode on `name` landing on a different
+    same-named place than the one actually picked.
+    """
+    if query_params.get("lat") or query_params.get("lon"):
+        return _handle_weather_by_coords(query_params)
+
     raw_city = query_params.get("city", "")
 
     try:
@@ -115,6 +147,104 @@ def _handle_weather(query_params: dict[str, str]) -> dict[str, Any]:
     return _response(200, weather_data)
 
 
+def _handle_weather_by_coords(query_params: dict[str, str]) -> dict[str, Any]:
+    """Handle the exact-match GET /weather?lat=&lon=&name=&country= form."""
+    try:
+        lat, lon = validate_coordinates(
+            query_params.get("lat", ""), query_params.get("lon", "")
+        )
+        name = validate_location_name(query_params.get("name", ""), "name")
+        country = validate_country_code(query_params.get("country", ""))
+    except ValidationError as exc:
+        logger.warning("Validation failed: %s", exc)
+        return _error(400, str(exc))
+
+    # Fixed-precision cache key keeps near-identical coordinates (e.g. two
+    # clicks on the same suggestion) hitting the same cache entry, the same
+    # way the city-name cache key normalises case.
+    cache_key = f"{lat:.4f},{lon:.4f}"
+
+    try:
+        cached = get_cached_weather(cache_key)
+    except CacheError:
+        cached = None
+
+    if cached is not None:
+        return _response(200, cached)
+
+    try:
+        api_key = get_api_key()
+    except SecretsError as exc:
+        logger.error("Weather credential retrieval failed: %s", exc)
+        return _error(503, "Weather service is temporarily unavailable.")
+
+    try:
+        weather_data = fetch_weather_by_coords(lat, lon, name, country, api_key)
+    except CityNotFoundError:
+        return _error(404, "Weather data was not found for that location.")
+    except WeatherClientError as exc:
+        logger.error("Weather client error: %s — attempting stale cache fallback", exc)
+        stale = get_stale_cached_weather(cache_key)
+        if stale is not None:
+            stale["stale"] = True
+            stale["stale_reason"] = "Live weather data is temporarily unavailable; showing last known values."
+            return _response(200, stale)
+        return _error(502, str(exc))
+
+    try:
+        set_cached_weather(cache_key, weather_data)
+    except CacheError:
+        pass
+
+    return _response(200, weather_data)
+
+
+def _handle_suggest(query_params: dict[str, str]) -> dict[str, Any]:
+    """
+    Handle GET /suggest?q=<partial city name> - powers the search-box
+    autocomplete dropdown.
+
+    Backed by GeoNames (geonames_suggest_cities), not OpenWeatherMap -
+    OWM's geocoding only does whole-word name matching, not prefix search,
+    so it can't power an autocomplete-as-you-type dropdown (confirmed live,
+    docs/WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md #1). No fallback to
+    OWM's suggest_cities() on a GeoNames failure - that plan doc's SEC.2
+    deliberately chose the same simple non-fatal degradation already used
+    everywhere else in this app over a second code path to maintain.
+
+    Degrades gracefully rather than erroring: a query shorter than
+    _SUGGEST_MIN_LENGTH or an upstream failure both return an empty
+    suggestions list (200) instead of a 4xx/5xx, since the dropdown is a
+    non-essential assist - the user can still submit the search form
+    directly either way.
+    """
+    raw_q = query_params.get("q", "")
+    trimmed = raw_q.strip() if isinstance(raw_q, str) else ""
+
+    if len(trimmed) < _SUGGEST_MIN_LENGTH:
+        return _response(200, {"suggestions": []})
+
+    try:
+        query = validate_city(trimmed)
+    except ValidationError as exc:
+        logger.warning("Suggest validation failed: %s", exc)
+        return _error(400, str(exc))
+
+    try:
+        geonames_username = get_geonames_username()
+    except SecretsError as exc:
+        logger.error("GeoNames credential retrieval failed: %s", exc)
+        return _response(200, {"suggestions": []})
+
+    try:
+        suggestions = geonames_suggest_cities(query, geonames_username, limit=_SUGGEST_LIMIT)
+    except WeatherClientError as exc:
+        logger.warning("Suggest fetch failed (non-fatal): %s", exc)
+        return _response(200, {"suggestions": []})
+
+    return _response(200, {"suggestions": suggestions})
+
+
 def _handle_health() -> dict[str, Any]:
     """Handle GET /health — used by the Route 53 failover health check."""
     return _response(200, {"status": "ok", "region": os.environ.get("AWS_REGION", "unknown")})
@@ -154,9 +284,11 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     Expected trigger: API Gateway HTTP API (proxy integration).
     Routes:
-      GET /weather?city=<name>      — fetch weather by city name
-      GET /locate?lat=<f>&lon=<f>   — reverse geocode coordinates to city name
-      GET /health                   — liveness/region check (Route 53 failover)
+      GET /weather?city=<name>                        — fetch weather by city name
+      GET /weather?lat=&lon=&name=&country=            — fetch weather for an exact /suggest pick
+      GET /suggest?q=<partial name>                    — autocomplete suggestions for the search box
+      GET /locate?lat=<f>&lon=<f>                      — reverse geocode coordinates to city name
+      GET /health                                      — liveness/region check (Route 53 failover)
     """
     http_method = (event.get("requestContext", {}).get("http", {}).get("method") or
                    event.get("httpMethod", "GET")).upper()
@@ -168,6 +300,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     if route_key == "GET /weather":
         return _handle_weather(query_params)
+    if route_key == "GET /suggest":
+        return _handle_suggest(query_params)
     if route_key == "GET /locate":
         return _handle_locate(query_params)
     if route_key == "GET /health":

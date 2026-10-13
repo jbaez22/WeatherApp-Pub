@@ -90,7 +90,7 @@ Notes:
 - Assumes 256 MB Lambda / 500 ms average duration
 - Assumes 15-minute cache reduces Lambda invocations to ~10% of CloudFront requests
 - CloudFront: $0.0085/GB after 1 TB Free Tier, assuming 1 KB average response
-- "Fixed floor" = Route 53 (~$0.51) + second CodePipeline + 2 KMS CMKs (~$3.00, see Free Tier Analysis above); excludes the separate ~$4.22/mo multi-region addition below, which doesn't scale with traffic
+- "Fixed floor" = Route 53 (~$0.51) + second CodePipeline + 2 KMS CMKs (~$3.00, see Free Tier Analysis above); excludes the separate ~$4.62/mo multi-region addition below, which doesn't scale with traffic
 
 ---
 
@@ -139,12 +139,13 @@ against the actual deployed resources (not just estimated):
 | Lambda in us-west-2 (passive — health checks only)                     | $0.05            |
 | API Gateway in us-west-2 (passive)                                     | $0.01            |
 | DynamoDB Global Tables replication writes                              | ~$0.15           |
-| Secrets Manager secret replica                                         | $0.40            |
+| Secrets Manager secret replica (OWM API key)                           | $0.40            |
+| Secrets Manager secret replica (GeoNames username)                     | $0.40            |
 | GuardDuty detector in us-west-2 (billed per region, unlike CloudTrail) | $3.00            |
 | Second regional artifacts bucket (us-west-2)                           | ~$0.01           |
 | Route 53 health check (1 endpoint)                                     | $0.50            |
 | CloudWatch alarm for failover status                                   | $0.10            |
-| **Total additional**                                                   | **~$4.22/month** |
+| **Total additional**                                                   | **~$4.62/month** |
 | ---------------------------------------------------------------------- | ---------------- |
 
 Dominated by the second GuardDuty detector — GuardDuty, unlike the

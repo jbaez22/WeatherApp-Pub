@@ -43,6 +43,14 @@ Parameters:
       output SecretName). Must match backend/lambda/ssm_secrets.py
       _SECRET_NAME.
 
+  GeonamesSecretName:
+    Type: String
+    Default: 'weather-dashboard/geonames-username'
+    Description: >
+      Secrets Manager secret name for the GeoNames username (from 07-ssm
+      stack output GeonamesSecretName). Must match
+      backend/lambda/secrets_manager.py's GEONAMES_SECRET_NAME default.
+
   AllowedOrigin:
     Type: String
     Default: 'https://weather.craftingnewtech.com'
@@ -176,7 +184,7 @@ Resources:
           - id: CKV_AWS_116
             comment: "DLQ applies to async Lambda invocations only; this function is invoked synchronously by API Gateway — DLQ has no effect here"
           - id: CKV_AWS_173
-            comment: "Env vars are non-sensitive (LOG_LEVEL, TABLE_NAME, SECRET_NAME, ALLOWED_ORIGIN); actual secret (API key) is in Secrets Manager, not env vars"
+            comment: "Env vars are non-sensitive (LOG_LEVEL, TABLE_NAME, SECRET_NAME, GEONAMES_SECRET_NAME, ALLOWED_ORIGIN); actual secrets (API key, GeoNames username) are in Secrets Manager, not env vars"
     Properties:
       FunctionName: !Sub '${ProjectName}-handler-${Environment}'
       Description: 'Fetches weather data from OWM API with DynamoDB caching (15 min TTL).'
@@ -194,6 +202,7 @@ Resources:
           LOG_LEVEL: INFO
           TABLE_NAME: !Ref DynamoDBTableName
           SECRET_NAME: !Ref SecretName
+          GEONAMES_SECRET_NAME: !Ref GeonamesSecretName
           ALLOWED_ORIGIN: !Ref AllowedOrigin
       # Phase 3: X-Ray active tracing. HTTP API (v2) has no first-class
       # TracingEnabled toggle like REST APIs — the code-level patch_all()

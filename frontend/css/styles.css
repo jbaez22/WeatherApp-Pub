@@ -229,7 +229,7 @@ button:focus-visible {
 .search-input {
   width: 100%;
   height: 48px;
-  padding: 0 1rem 0 2.75rem;
+  padding: 0 2.5rem 0 2.75rem;
   border: 1.5px solid var(--color-border);
   border-radius: var(--radius-md);
   font-size: 1rem;
@@ -251,6 +251,113 @@ button:focus-visible {
   border-color: var(--color-error);
   box-shadow: 0 0 0 3px rgba(220, 38, 38, .12);
 }
+
+/* ── Clear button (inside search input wrap) ─────────────────────────────── */
+.clear-input-btn {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 50%;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 0;
+  transition: color .15s, background .15s;
+}
+
+.clear-input-btn svg {
+  width: 16px;
+  height: 16px;
+  pointer-events: none;
+}
+
+.clear-input-btn:hover {
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+
+.clear-input-btn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+/* ── Suggestions dropdown (search-box autocomplete) ──────────────────────── */
+.suggestions-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin: 0;
+  padding: .4rem;
+  list-style: none;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+}
+
+.suggestion-item {
+  display: flex;
+  align-items: center;
+  gap: .65rem;
+  padding: .6rem .65rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.suggestion-item:hover,
+.suggestion-item.suggestion-item--active {
+  background: var(--color-accent-bg);
+}
+
+.suggestion-item__icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  color: var(--color-text-muted);
+}
+
+.suggestion-item__text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.suggestion-item__name {
+  font-size: .9rem;
+  font-weight: 600;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.suggestion-item__meta {
+  font-size: .78rem;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.suggestion-item--empty {
+  cursor: default;
+  color: var(--color-text-muted);
+  font-size: .85rem;
+  padding: .6rem .65rem;
+}
+
+.suggestion-item--empty:hover { background: none; }
 
 .search-attribution {
   font-size: .8rem;

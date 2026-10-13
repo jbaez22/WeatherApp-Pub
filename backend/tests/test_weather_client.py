@@ -25,7 +25,10 @@ from weather_client import (
     CityNotFoundError,
     WeatherClientError,
     fetch_weather,
+    fetch_weather_by_coords,
+    geonames_suggest_cities,
     reverse_geocode,
+    suggest_cities,
 )
 
 _GEO_REVERSE_URL = "https://api.openweathermap.org/geo/1.0/reverse"
@@ -36,6 +39,8 @@ _CITY = "london"
 _GEO_URL = "https://api.openweathermap.org/geo/1.0/direct"
 _ONECALL_URL = "https://api.openweathermap.org/data/3.0/onecall"
 _AIR_POLLUTION_URL = "https://api.openweathermap.org/data/2.5/air_pollution"
+_GEONAMES_URL = "https://secure.geonames.org/searchJSON"
+_GEONAMES_USER = "test-geonames-user"
 
 _GEO_RESPONSE = [
     {"name": "London", "lat": 51.5074, "lon": -0.1278, "country": "GB"}
@@ -540,3 +545,302 @@ class TestReverseGeocode:
             m.get(_GEO_REVERSE_URL, exc=requests.exceptions.ConnectionError)
             with pytest.raises(WeatherClientError, match="Unable to reach"):
                 reverse_geocode(self._LAT, self._LON, _API_KEY)
+
+
+_SUGGEST_RESPONSE = [
+    {"name": "Woodbourne", "lat": 41.7343, "lon": -74.6104, "country": "US", "state": "New York"},
+    {"name": "Woodbourne", "lat": 41.1998, "lon": -74.6821, "country": "US", "state": "New Jersey"},
+]
+
+
+class TestSuggestCities:
+    def test_returns_mapped_fields(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEO_URL, json=_SUGGEST_RESPONSE)
+            result = suggest_cities("woodbourne", _API_KEY)
+
+        assert len(result) == 2
+        first = result[0]
+        for field in ("name", "state", "country", "lat", "lon"):
+            assert field in first
+
+    def test_name_state_country_values_preserved(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEO_URL, json=_SUGGEST_RESPONSE)
+            result = suggest_cities("woodbourne", _API_KEY)
+
+        assert result[0]["name"] == "Woodbourne"
+        assert result[0]["state"] == "New York"
+        assert result[1]["state"] == "New Jersey"
+
+    def test_missing_state_defaults_to_empty_string(self):
+        geo = [{"name": "Blenheim", "lat": -41.5, "lon": 173.9, "country": "NZ"}]
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEO_URL, json=geo)
+            result = suggest_cities("blenheim", _API_KEY)
+
+        assert result[0]["state"] == ""
+
+    def test_empty_result_returns_empty_list_not_error(self):
+        """Unlike _geocode()/fetch_weather(), an empty match list while the
+        user is still typing is normal, not CityNotFoundError."""
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEO_URL, json=[])
+            result = suggest_cities("unknowncityxyz", _API_KEY)
+
+        assert result == []
+
+    def test_limit_param_sent_to_geocode(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEO_URL, json=_SUGGEST_RESPONSE)
+            suggest_cities("woodbourne", _API_KEY, limit=3)
+
+        req = m.request_history[0]
+        assert req.qs.get("limit") == ["3"]
+
+    def test_query_sent_as_q_param(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEO_URL, json=_SUGGEST_RESPONSE)
+            suggest_cities("woodbourne", _API_KEY)
+
+        req = m.request_history[0]
+        assert req.qs.get("q") == ["woodbourne"]
+
+    def test_401_raises_weather_client_error(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEO_URL, status_code=401)
+            with pytest.raises(WeatherClientError, match="authentication"):
+                suggest_cities("woodbourne", _API_KEY)
+
+    def test_timeout_raises_weather_client_error(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEO_URL, exc=requests.exceptions.Timeout)
+            with pytest.raises(WeatherClientError, match="did not respond"):
+                suggest_cities("woodbourne", _API_KEY)
+
+
+class TestFetchWeatherByCoords:
+    _LAT = 41.7343
+    _LON = -74.6104
+
+    def test_skips_geocode_call_entirely(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_ONECALL_URL, json=_ONECALL_RESPONSE)
+            m.get(_AIR_POLLUTION_URL, json=_AIR_POLLUTION_RESPONSE)
+            fetch_weather_by_coords(self._LAT, self._LON, "Woodbourne", "US", _API_KEY)
+
+        urls_called = {r.url.split("?")[0] for r in m.request_history}
+        assert _GEO_URL not in urls_called
+
+    def test_display_name_and_country_pass_through(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_ONECALL_URL, json=_ONECALL_RESPONSE)
+            m.get(_AIR_POLLUTION_URL, json=_AIR_POLLUTION_RESPONSE)
+            result = fetch_weather_by_coords(self._LAT, self._LON, "Woodbourne", "US", _API_KEY)
+
+        assert result["current"]["name"] == "Woodbourne"
+        assert result["current"]["sys"]["country"] == "US"
+
+    def test_lat_lon_sent_to_onecall(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_ONECALL_URL, json=_ONECALL_RESPONSE)
+            m.get(_AIR_POLLUTION_URL, json=_AIR_POLLUTION_RESPONSE)
+            fetch_weather_by_coords(self._LAT, self._LON, "Woodbourne", "US", _API_KEY)
+
+        req = next(r for r in m.request_history if _ONECALL_URL in r.url)
+        assert req.qs.get("lat") == [str(self._LAT)]
+        assert req.qs.get("lon") == [str(self._LON)]
+
+    def test_onecall_error_raises_weather_client_error(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_ONECALL_URL, status_code=500)
+            m.get(_AIR_POLLUTION_URL, json=_AIR_POLLUTION_RESPONSE)
+            with pytest.raises(WeatherClientError, match="unexpected error"):
+                fetch_weather_by_coords(self._LAT, self._LON, "Woodbourne", "US", _API_KEY)
+
+    def test_air_quality_failure_is_non_fatal(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_ONECALL_URL, json=_ONECALL_RESPONSE)
+            m.get(_AIR_POLLUTION_URL, status_code=500)
+            result = fetch_weather_by_coords(self._LAT, self._LON, "Woodbourne", "US", _API_KEY)
+
+        assert "epa_aqi" not in result
+        assert "current" in result
+
+
+_GEONAMES_RESPONSE = {
+    "geonames": [
+        {
+            "name": "Woodbourne", "adminName1": "New York", "countryCode": "US",
+            "lat": "41.761057", "lng": "-74.597721",
+        },
+        {
+            "name": "Woodbourne", "adminName1": "New Jersey", "countryCode": "US",
+            "lat": "41.20454", "lng": "-74.6429401",
+        },
+    ],
+    "totalResultsCount": 2,
+}
+
+
+class TestGeonamesSuggestCities:
+    """
+    GeoNames' prefix search is the whole point of this upgrade (confirmed
+    live: OWM's suggest_cities() can only match whole words, not partial
+    prefixes like "woodb" - see
+    docs/WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md #1). These tests
+    cover GeoNames' different error-signaling shape (HTTP 200 + an embedded
+    status object, not real 401/429) and its different field names
+    (lng/str instead of lon/float).
+    """
+
+    def test_returns_mapped_fields(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json=_GEONAMES_RESPONSE)
+            result = geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+        assert len(result) == 2
+        for field in ("name", "state", "country", "lat", "lon"):
+            assert field in result[0]
+
+    def test_name_state_country_values_preserved(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json=_GEONAMES_RESPONSE)
+            result = geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+        assert result[0]["name"] == "Woodbourne"
+        assert result[0]["state"] == "New York"
+        assert result[1]["state"] == "New Jersey"
+
+    def test_lat_lng_normalised_to_lat_lon_floats(self):
+        """GeoNames returns lat/lng as strings under a differently-named
+        'lng' key - both must be normalised to match suggest_cities()'s
+        (OWM) float lat/lon contract that the frontend expects."""
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json=_GEONAMES_RESPONSE)
+            result = geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+        assert result[0]["lat"] == 41.761057
+        assert isinstance(result[0]["lat"], float)
+        assert result[0]["lon"] == -74.597721
+        assert isinstance(result[0]["lon"], float)
+
+    def test_missing_state_defaults_to_empty_string(self):
+        geo = {"geonames": [{"name": "Blenheim", "countryCode": "NZ", "lat": "-41.5", "lng": "173.9"}]}
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json=geo)
+            result = geonames_suggest_cities("blenheim", _GEONAMES_USER)
+
+        assert result[0]["state"] == ""
+
+    def test_query_sent_as_name_starts_with_param(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json=_GEONAMES_RESPONSE)
+            geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+        req = m.request_history[0]
+        assert req.qs.get("name_startswith") == ["woodb"]
+
+    def test_username_sent_as_username_param(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json=_GEONAMES_RESPONSE)
+            geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+        req = m.request_history[0]
+        assert req.qs.get("username") == [_GEONAMES_USER]
+
+    def test_feature_class_restricted_to_populated_places(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json=_GEONAMES_RESPONSE)
+            geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+        req = m.request_history[0]
+        # requests_mock lowercases both query keys and values in .qs.
+        assert req.qs.get("featureclass") == ["p"]
+
+    def test_style_full_requested_for_admin_name(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json=_GEONAMES_RESPONSE)
+            geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+        req = m.request_history[0]
+        # requests_mock lowercases both query keys and values in .qs.
+        assert req.qs.get("style") == ["full"]
+
+    def test_limit_sent_as_max_rows_param(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json=_GEONAMES_RESPONSE)
+            geonames_suggest_cities("woodb", _GEONAMES_USER, limit=3)
+
+        req = m.request_history[0]
+        assert req.qs.get("maxrows") == ["3"]
+
+    def test_no_result_status_code_returns_empty_list_not_error(self):
+        """Status code 15 ('no result found') is GeoNames' normal 'nothing
+        matched yet' response while the user is still typing - not an
+        error, same semantics as suggest_cities() (OWM)."""
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json={"status": {"message": "no result found", "value": 15}})
+            result = geonames_suggest_cities("zzzznotreal", _GEONAMES_USER)
+
+        assert result == []
+
+    def test_empty_geonames_list_returns_empty_list(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json={"geonames": [], "totalResultsCount": 0})
+            result = geonames_suggest_cities("zzzznotreal", _GEONAMES_USER)
+
+        assert result == []
+
+    def test_auth_error_status_code_raises_weather_client_error(self):
+        """Status code 10 ('authorization exception') is what GeoNames
+        returns - still HTTP 200 - if 'Free Web Services' was never
+        enabled on the account (see plan doc #3's account gotcha)."""
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json={"status": {"message": "user account not enabled", "value": 10}})
+            with pytest.raises(WeatherClientError, match="authentication"):
+                geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+    def test_daily_limit_status_code_raises_weather_client_error(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json={"status": {"message": "daily limit exceeded", "value": 18}})
+            with pytest.raises(WeatherClientError, match="rate limit"):
+                geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+    def test_hourly_limit_status_code_raises_weather_client_error(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json={"status": {"message": "hourly limit exceeded", "value": 19}})
+            with pytest.raises(WeatherClientError, match="rate limit"):
+                geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+    def test_weekly_limit_status_code_raises_weather_client_error(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json={"status": {"message": "weekly limit exceeded", "value": 20}})
+            with pytest.raises(WeatherClientError, match="rate limit"):
+                geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+    def test_unrecognized_status_code_raises_weather_client_error(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, json={"status": {"message": "invalid parameter", "value": 14}})
+            with pytest.raises(WeatherClientError, match="unexpected error"):
+                geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+    def test_http_500_raises_weather_client_error(self):
+        """A genuine non-2xx HTTP response (vs. GeoNames' usual HTTP-200
+        status-object errors) must still be caught."""
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, status_code=500)
+            with pytest.raises(WeatherClientError, match="unexpected error"):
+                geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+    def test_timeout_raises_weather_client_error(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, exc=requests.exceptions.Timeout)
+            with pytest.raises(WeatherClientError, match="did not respond"):
+                geonames_suggest_cities("woodb", _GEONAMES_USER)
+
+    def test_connection_error_raises_weather_client_error(self):
+        with requests_mock_lib.Mocker() as m:
+            m.get(_GEONAMES_URL, exc=requests.exceptions.ConnectionError)
+            with pytest.raises(WeatherClientError, match="Unable to reach"):
+                geonames_suggest_cities("woodb", _GEONAMES_USER)

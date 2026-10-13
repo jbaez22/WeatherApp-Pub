@@ -81,6 +81,32 @@ def _locate_event(lat: str = "40.71", lon: str = "-74.01") -> dict:
     }
 
 
+def _suggest_event(q: str | None = "woodbourne") -> dict:
+    """Build a /suggest proxy event."""
+    return {
+        "routeKey": "GET /suggest",
+        "requestContext": {"http": {"method": "GET"}},
+        "queryStringParameters": {"q": q} if q is not None else {},
+    }
+
+
+def _weather_by_coords_event(
+    lat: str = "41.7343", lon: str = "-74.6104", name: str = "Woodbourne", country: str = "US"
+) -> dict:
+    """Build a GET /weather proxy event using the lat/lon exact-match form."""
+    return {
+        "routeKey": "GET /weather",
+        "requestContext": {"http": {"method": "GET"}},
+        "queryStringParameters": {"lat": lat, "lon": lon, "name": name, "country": country},
+    }
+
+
+_SUGGEST_RESULTS = [
+    {"name": "Woodbourne", "state": "New York", "country": "US", "lat": 41.7343, "lon": -74.6104},
+    {"name": "Woodbourne", "state": "New Jersey", "country": "US", "lat": 41.1998, "lon": -74.6821},
+]
+
+
 class TestOptionsPreFlight:
     def test_options_returns_200(self):
         response = handler(_event(method="OPTIONS"), None)
@@ -310,6 +336,178 @@ class TestHealthRoute:
             handler(_event(city=None, route_key="GET /health"), None)
         mock_cache.assert_not_called()
         mock_secrets.assert_not_called()
+
+
+class TestSuggestRoute:
+    """
+    GET /suggest is backed by GeoNames (geonames_suggest_cities), not OWM -
+    see weather_client.py's module docstring and
+    docs/WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md. No fallback to
+    OWM's suggest_cities() on a GeoNames failure (SEC.2's resolved
+    decision) - every failure path below degrades to an empty list, same
+    as the rest of this non-fatal-by-design handler.
+    """
+
+    def test_returns_200_with_suggestions(self):
+        with patch("weather_handler.get_geonames_username", return_value="geo-user"), \
+             patch("weather_handler.geonames_suggest_cities", return_value=_SUGGEST_RESULTS):
+            response = handler(_suggest_event(), None)
+        assert response["statusCode"] == 200
+        assert json.loads(response["body"]) == {"suggestions": _SUGGEST_RESULTS}
+
+    def test_query_below_min_length_returns_empty_list_without_calling_geonames(self):
+        with patch("weather_handler.geonames_suggest_cities") as mock_suggest:
+            response = handler(_suggest_event(q="w"), None)
+        assert response["statusCode"] == 200
+        assert json.loads(response["body"]) == {"suggestions": []}
+        mock_suggest.assert_not_called()
+
+    def test_missing_query_returns_empty_list(self):
+        with patch("weather_handler.geonames_suggest_cities") as mock_suggest:
+            response = handler(_suggest_event(q=None), None)
+        assert response["statusCode"] == 200
+        assert json.loads(response["body"]) == {"suggestions": []}
+        mock_suggest.assert_not_called()
+
+    def test_invalid_characters_returns_400(self):
+        response = handler(_suggest_event(q="<script>xx"), None)
+        assert response["statusCode"] == 400
+
+    def test_geonames_credential_failure_degrades_to_empty_list_not_503(self):
+        """The dropdown is a non-essential assist - a Secrets Manager
+        outage must not surface as an error the user has to dismiss while
+        typing."""
+        from secrets_manager import SecretsError
+        with patch("weather_handler.get_geonames_username", side_effect=SecretsError("down")):
+            response = handler(_suggest_event(), None)
+        assert response["statusCode"] == 200
+        assert json.loads(response["body"]) == {"suggestions": []}
+
+    def test_geonames_failure_degrades_to_empty_list_not_502(self):
+        from weather_client import WeatherClientError
+        with patch("weather_handler.get_geonames_username", return_value="geo-user"), \
+             patch("weather_handler.geonames_suggest_cities", side_effect=WeatherClientError("down")):
+            response = handler(_suggest_event(), None)
+        assert response["statusCode"] == 200
+        assert json.loads(response["body"]) == {"suggestions": []}
+
+    def test_limit_passed_through(self):
+        with patch("weather_handler.get_geonames_username", return_value="geo-user"), \
+             patch("weather_handler.geonames_suggest_cities", return_value=[]) as mock_suggest:
+            handler(_suggest_event(), None)
+        _args, kwargs = mock_suggest.call_args
+        assert kwargs.get("limit") == 5
+
+
+class TestWeatherByCoordsRoute:
+    def _patches(self, weather_data=None):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("weather_handler.get_cached_weather", return_value=None))
+        stack.enter_context(patch("weather_handler.get_api_key", return_value="test-key"))
+        stack.enter_context(
+            patch("weather_handler.fetch_weather_by_coords", return_value=weather_data or _SAMPLE_WEATHER)
+        )
+        stack.enter_context(patch("weather_handler.set_cached_weather"))
+        return stack
+
+    def test_returns_200(self):
+        with self._patches():
+            response = handler(_weather_by_coords_event(), None)
+        assert response["statusCode"] == 200
+
+    def test_skips_free_text_city_geocode_path(self):
+        """Confirms the lat/lon form routes to fetch_weather_by_coords, not
+        the free-text fetch_weather() - the whole point is avoiding a
+        second, possibly-ambiguous geocode of the same-named city."""
+        with self._patches(), patch("weather_handler.fetch_weather") as mock_fetch_weather:
+            handler(_weather_by_coords_event(), None)
+        mock_fetch_weather.assert_not_called()
+
+    def test_coords_name_country_passed_through(self):
+        with self._patches() as _, \
+             patch("weather_handler.fetch_weather_by_coords", return_value=_SAMPLE_WEATHER) as mock_fetch:
+            handler(_weather_by_coords_event(lat="41.7343", lon="-74.6104", name="Woodbourne", country="US"), None)
+        mock_fetch.assert_called_once_with(41.7343, -74.6104, "Woodbourne", "US", "test-key")
+
+    def test_missing_name_returns_400(self):
+        event = _weather_by_coords_event()
+        event["queryStringParameters"] = {"lat": "41.73", "lon": "-74.61"}
+        response = handler(event, None)
+        assert response["statusCode"] == 400
+
+    def test_invalid_lat_returns_400(self):
+        response = handler(_weather_by_coords_event(lat="999"), None)
+        assert response["statusCode"] == 400
+
+    def test_cache_key_uses_fixed_precision_coords(self):
+        with patch("weather_handler.get_cached_weather", return_value=None) as mock_get, \
+             patch("weather_handler.get_api_key", return_value="key"), \
+             patch("weather_handler.fetch_weather_by_coords", return_value=_SAMPLE_WEATHER), \
+             patch("weather_handler.set_cached_weather"):
+            handler(_weather_by_coords_event(lat="41.7343", lon="-74.6104"), None)
+        mock_get.assert_called_once_with("41.7343,-74.6104")
+
+    def test_cache_hit_skips_api_call(self):
+        with patch("weather_handler.get_cached_weather", return_value=_SAMPLE_WEATHER), \
+             patch("weather_handler.fetch_weather_by_coords") as mock_fetch:
+            response = handler(_weather_by_coords_event(), None)
+        assert response["statusCode"] == 200
+        mock_fetch.assert_not_called()
+
+    def test_city_not_found_returns_404(self):
+        from weather_client import CityNotFoundError
+        with patch("weather_handler.get_cached_weather", return_value=None), \
+             patch("weather_handler.get_api_key", return_value="key"), \
+             patch("weather_handler.fetch_weather_by_coords", side_effect=CityNotFoundError("nope")):
+            response = handler(_weather_by_coords_event(), None)
+        assert response["statusCode"] == 404
+
+    def test_weather_client_error_returns_502_when_no_stale_cache(self):
+        from weather_client import WeatherClientError
+        with patch("weather_handler.get_cached_weather", return_value=None), \
+             patch("weather_handler.get_api_key", return_value="key"), \
+             patch("weather_handler.fetch_weather_by_coords", side_effect=WeatherClientError("down")), \
+             patch("weather_handler.get_stale_cached_weather", return_value=None):
+            response = handler(_weather_by_coords_event(), None)
+        assert response["statusCode"] == 502
+
+    def test_ssm_failure_returns_503(self):
+        from secrets_manager import SecretsError
+        with patch("weather_handler.get_cached_weather", return_value=None), \
+             patch("weather_handler.get_api_key", side_effect=SecretsError("SSM down")):
+            response = handler(_weather_by_coords_event(), None)
+        assert response["statusCode"] == 503
+
+    def test_cache_read_error_falls_through_to_live_fetch(self):
+        from cache import CacheError
+        with patch("weather_handler.get_cached_weather", side_effect=CacheError("DB error")), \
+             patch("weather_handler.get_api_key", return_value="key"), \
+             patch("weather_handler.fetch_weather_by_coords", return_value=_SAMPLE_WEATHER), \
+             patch("weather_handler.set_cached_weather"):
+            response = handler(_weather_by_coords_event(), None)
+        assert response["statusCode"] == 200
+
+    def test_weather_client_error_falls_back_to_stale_cache(self):
+        from weather_client import WeatherClientError
+        with patch("weather_handler.get_cached_weather", return_value=None), \
+             patch("weather_handler.get_api_key", return_value="key"), \
+             patch("weather_handler.fetch_weather_by_coords", side_effect=WeatherClientError("down")), \
+             patch("weather_handler.get_stale_cached_weather", return_value=dict(_SAMPLE_WEATHER)):
+            response = handler(_weather_by_coords_event(), None)
+        assert response["statusCode"] == 200
+        body = json.loads(response["body"])
+        assert body["stale"] is True
+        assert "stale_reason" in body
+
+    def test_cache_write_error_does_not_affect_response(self):
+        from cache import CacheError
+        with patch("weather_handler.get_cached_weather", return_value=None), \
+             patch("weather_handler.get_api_key", return_value="key"), \
+             patch("weather_handler.fetch_weather_by_coords", return_value=_SAMPLE_WEATHER), \
+             patch("weather_handler.set_cached_weather", side_effect=CacheError("write fail")):
+            response = handler(_weather_by_coords_event(), None)
+        assert response["statusCode"] == 200
 
 
 class TestResponseShape:

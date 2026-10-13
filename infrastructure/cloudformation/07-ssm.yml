@@ -35,6 +35,17 @@ Parameters:
       Secrets Manager secret name for the OpenWeatherMap API key.
       Change only if you override SECRET_NAME on the Lambda.
 
+  # GeoNames Suggest Upgrade — docs/WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md.
+  # Separate secret from SecretName above (not a shared/multi-field secret)
+  # so the OWM key's RotationSchedule below never touches it — a GeoNames
+  # username isn't a rotatable credential the way an API key is.
+  GeonamesSecretName:
+    Type: String
+    Default: 'weather-dashboard/geonames-username'
+    Description: >
+      Secrets Manager secret name for the GeoNames web-service username.
+      Change only if you override GEONAMES_SECRET_NAME on the Lambda.
+
   ReplicaRegion:
     Type: String
     Default: ''
@@ -119,6 +130,33 @@ Resources:
         OpenWeatherMap API key — placeholder at stack-create; set the real
         value post-deploy via CLI, rotated every 90 days via
         RotationSchedule below.
+      SecretString: 'PLACEHOLDER_SET_REAL_VALUE_AFTER_BOOTSTRAP'
+      KmsKeyId: !Ref SecretsKmsKey
+      ReplicaRegions: !If
+        - HasReplicaRegion
+        - - Region: !Ref ReplicaRegion
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Same placeholder-at-create pattern as ApiKeySecret above — CloudFormation
+  # owns creation, an operator sets the real value post-deploy via CLI (see
+  # docs/WeatherApp-GeoNames-Suggest-Upgrade-Plan-V1.md SEC.5). No
+  # RotationSchedule: a GeoNames username is a free-tier account identifier,
+  # not a rotatable credential like the OWM key below.
+  GeonamesSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Ref GeonamesSecretName
+      Description: >
+        GeoNames web-service username — placeholder at stack-create; set the
+        real value post-deploy via CLI. Powers GET /suggest's prefix search
+        (geonames.org), separate from the OWM API key above.
       SecretString: 'PLACEHOLDER_SET_REAL_VALUE_AFTER_BOOTSTRAP'
       KmsKeyId: !Ref SecretsKmsKey
       ReplicaRegions: !If
@@ -329,3 +367,21 @@ Outputs:
     Value: !Ref ApiKeySecret
     Export:
       Name: !Sub '${AWS::StackName}-SecretArn'
+
+  GeonamesSecretName:
+    Description: >
+      Secrets Manager secret name for the GeoNames username — referenced by
+      the Lambda GEONAMES_SECRET_NAME environment variable in 05-backend.yml.
+    Value: !Ref GeonamesSecretName
+    Export:
+      Name: !Sub '${AWS::StackName}-GeonamesSecretName'
+
+  GeonamesSecretArn:
+    Description: >
+      Full GeoNames secret ARN — 01-iam.yml computes its own wildcard ARN
+      from ProjectName instead (see that file's SecretsManagerAccess
+      comment on why GetAtt would deadlock), so this output exists for
+      visibility/debugging only, not as a cross-stack reference.
+    Value: !Ref GeonamesSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-GeonamesSecretArn'

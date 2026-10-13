@@ -76,6 +76,7 @@ Resources:
         HookRoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-hook-role-${Environment}'
         DynamoDBTableName: WeatherCache
         SecretName: !Sub '${ProjectName}/openweathermap-api-key'
+        GeonamesSecretName: !Sub '${ProjectName}/geonames-username'
         AllowedOrigin: 'https://weather.craftingnewtech.com'
         ArtifactsBucketName: !Ref ArtifactsBucketName
         LambdaZipKey: !Ref LambdaZipKey
